@@ -1,0 +1,28 @@
+# Copy to the pinned OpenWA checkout as .env. Never commit the populated file.
+NODE_ENV=production
+PORT=2785
+LOG_LEVEL=info
+
+# Single-session, durable local deployment.
+DATABASE_TYPE=sqlite
+DATABASE_SYNCHRONIZE=true
+MAIN_DATABASE_SYNCHRONIZE=true
+STORAGE_TYPE=local
+STORAGE_LOCAL_PATH=./data/media
+SESSION_DATA_PATH=./data/sessions
+REDIS_ENABLED=false
+QUEUE_ENABLED=false
+
+# Lower-risk engine required by MILESTONE_3. One Chromium instance needs RAM/headroom.
+ENGINE_TYPE=whatsapp-web.js
+PUPPETEER_HEADLESS=true
+AUTO_START_SESSIONS=true
+MAX_CONCURRENT_SESSIONS=1
+
+# Generate independent random values during deployment.
+API_MASTER_KEY=replace-with-a-long-random-openwa-admin-key
+
+# OpenWA stays on 127.0.0.1:2785; do not proxy its bundled dashboard publicly.
+ENABLE_SWAGGER=false
+MCP_ENABLED=false
+

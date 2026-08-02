@@ -1,0 +1,1 @@
+"""OpenWA webhook adapter."""
