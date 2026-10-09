@@ -10,6 +10,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
+from personal_agent.domain.database import JSONData
+
 revision: str = "20260801_0005"
 down_revision: str | None = "20260801_0004"
 branch_labels: str | Sequence[str] | None = None
@@ -34,11 +36,11 @@ def upgrade() -> None:
         sa.Column("channel", sa.String(length=50), nullable=False),
         sa.Column("external_id", sa.String(length=255), nullable=False),
         sa.Column("display_name", sa.String(length=255), nullable=False),
-        sa.Column("aliases", sa.JSON(), nullable=False),
-        sa.Column("conversation_ids", sa.JSON(), nullable=False),
+        sa.Column("aliases", JSONData(), nullable=False),
+        sa.Column("conversation_ids", JSONData(), nullable=False),
         sa.Column("relationship", sa.String(length=100), nullable=True),
-        sa.Column("operational_facts", sa.JSON(), nullable=False),
-        sa.Column("source_event_ids", sa.JSON(), nullable=False),
+        sa.Column("operational_facts", JSONData(), nullable=False),
+        sa.Column("source_event_ids", JSONData(), nullable=False),
         sa.Column("confidence", sa.Float(), nullable=False),
         sa.Column("last_relevant_interaction_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
@@ -151,7 +153,7 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column("urgent", sa.Boolean(), nullable=False, server_default=sa.false()),
-        sa.Column("event_ids", sa.JSON(), nullable=False),
+        sa.Column("event_ids", JSONData(), nullable=False),
         sa.Column("dedupe_key", sa.String(length=255), nullable=False),
         sa.Column("processed_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
@@ -175,8 +177,8 @@ def upgrade() -> None:
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("session_id", sa.String(length=255), nullable=False),
         sa.Column("conversation_id", sa.Uuid(), nullable=True),
-        sa.Column("source_event_ids", sa.JSON(), nullable=False),
-        sa.Column("interpretation_payload", sa.JSON(), nullable=False),
+        sa.Column("source_event_ids", JSONData(), nullable=False),
+        sa.Column("interpretation_payload", JSONData(), nullable=False),
         sa.Column(
             "status",
             sa.Enum(

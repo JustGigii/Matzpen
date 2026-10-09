@@ -1,13 +1,23 @@
 import logging
+import re
 import uuid
 from collections.abc import Collection
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
+from difflib import SequenceMatcher
 from typing import TYPE_CHECKING, Literal
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from telegram import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from telegram import (
+    CallbackQuery,
+    ForceReply,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    Update,
+)
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
@@ -19,21 +29,35 @@ from telegram.ext import (
 )
 
 from personal_agent.core.time import utc_now
-from personal_agent.domain.enums import ApprovalStatus, EventDirection, EventSource
+from personal_agent.domain.enums import (
+    ApprovalStatus,
+    CommitmentStatus,
+    EventDirection,
+    EventSource,
+    MemoryStatus,
+    ProcessingStatus,
+    Sensitivity,
+    TaskStatus,
+    WhatsAppConversationType,
+)
 from personal_agent.domain.models import (
     ApprovalRequest,
+    CalendarAction,
     Commitment,
     Event,
     MemoryFact,
     Reminder,
     Task,
+    WhatsAppConversation,
 )
 from personal_agent.domain.schemas import NormalizedEvent
+from personal_agent.integrations.llm.base import LLMRetryableError
 from personal_agent.integrations.telegram.presentation import (
     approval_card,
     clarification_card,
     pending_action_card,
     reminder_card,
+    retryable_llm_message,
     timetable_card,
 )
 from personal_agent.services.control import AgentControl
@@ -43,9 +67,11 @@ if TYPE_CHECKING:
     from personal_agent.services.briefs import MorningBriefService
     from personal_agent.services.calendar import CalendarService
     from personal_agent.services.confirmations import ConfirmationService
+    from personal_agent.services.conversation import ConversationService
     from personal_agent.services.intake import IntakeService
     from personal_agent.services.media import MediaTextService
     from personal_agent.services.reminders import ReminderService
+    from personal_agent.services.whatsapp import WhatsAppService
 
 
 SpokenIntent = Literal["today", "calendar", "tasks", "commitments", "status", "help"]
@@ -53,6 +79,92 @@ logger = logging.getLogger(__name__)
 NO_ACTION_MESSAGE = (
     'לא מצאתי בהודעה פעולה שאפשר לבצע. אפשר לנסח אותה כבקשה, למשל: "קבע פגישה עם יואל מחר ב־17:00".'
 )
+
+
+@dataclass(frozen=True)
+class SpokenItemResolution:
+    action: Literal["done", "cancel"]
+    ordinal: int | None = None
+    title_hint: str | None = None
+    item_kind: Literal["task", "commitment"] | None = None
+
+
+def classify_item_resolution(text: str) -> SpokenItemResolution | None:
+    """Recognize a bounded request to complete or cancel one existing list item."""
+    normalized = " ".join(text.casefold().split()).strip("?!., ")
+    if re.search(
+        r"\b(?:אל\s+(?:תמחק|תמחוק|תבטל|תסיר|תעיף|תוריד)|"
+        r"לא\s+(?:למחוק|לבטל|להסיר|להעיף|להוריד|סיימתי|עשיתי|בוצע))\b",
+        normalized,
+    ):
+        return None
+    cancel_match = re.search(
+        r"\b(?:תמחק|תמחוק|מחק|למחוק|תבטל|בטל|תסיר|הסר|תעיף|עיף|תוריד|הורד|"
+        r"לא\s+רלוונטי(?:ת|ים|ות)?|לא\s+צריך|עזוב|תוותר|וותר)\b",
+        normalized,
+    )
+    done_match = re.search(
+        r"\b(?:סיימתי|סיימנו|השלמתי|גמרתי|בוצע|בוצעה|עשיתי|טופל|טופלה|סגור)\b",
+        normalized,
+    )
+    if cancel_match is None and done_match is None:
+        return None
+    action: Literal["done", "cancel"] = "cancel" if cancel_match is not None else "done"
+    item_kind: Literal["task", "commitment"] | None = None
+    if re.search(r"\bמשימ\w*", normalized):
+        item_kind = "task"
+    elif re.search(r"\bהתחייב\w*", normalized):
+        item_kind = "commitment"
+    ordinal_words = {
+        "הראשון": 1,
+        "הראשונה": 1,
+        "השני": 2,
+        "השנייה": 2,
+        "השניה": 2,
+        "השלישי": 3,
+        "השלישית": 3,
+        "הרביעי": 4,
+        "הרביעית": 4,
+        "החמישי": 5,
+        "החמישית": 5,
+        "השישי": 6,
+        "השישית": 6,
+        "השביעי": 7,
+        "השביעית": 7,
+        "השמיני": 8,
+        "השמינית": 8,
+        "התשיעי": 9,
+        "התשיעית": 9,
+        "העשירי": 10,
+        "העשירית": 10,
+    }
+    for word, ordinal in ordinal_words.items():
+        if word in normalized.split():
+            return SpokenItemResolution(action=action, ordinal=ordinal, item_kind=item_kind)
+    numeric = re.search(r"(?<!\d)(10|[1-9])(?!\d)", normalized)
+    if numeric is not None:
+        return SpokenItemResolution(
+            action=action,
+            ordinal=int(numeric.group(1)),
+            item_kind=item_kind,
+        )
+
+    match = cancel_match or done_match
+    assert match is not None
+    before = normalized[: match.start()].strip()
+    after = normalized[match.end() :].strip()
+    title_hint = after or before
+    title_hint = re.sub(
+        r"^(?:לי\s+)?(?:את\s+)?(?:המשימה|ההתחייבות|הפריט)?\s*(?:של|על)?\s*",
+        "",
+        title_hint,
+    )
+    title_hint = re.sub(r"\s+(?:בבקשה|לי)$", "", title_hint).strip()
+    return SpokenItemResolution(
+        action=action,
+        title_hint=title_hint or None,
+        item_kind=item_kind,
+    )
 
 
 def classify_spoken_intent(text: str) -> SpokenIntent | None:
@@ -99,6 +211,25 @@ def classify_spoken_intent(text: str) -> SpokenIntent | None:
     for intent, candidates in phrases:
         if normalized in candidates:
             return intent
+
+    # Telegram and WhatsApp input often contains small mobile-keyboard typos.  Keep this
+    # deterministic router deliberately narrow: it must contain a task-like token and a
+    # navigation/resolution cue, so an actual reminder request is still sent to the LLM.
+    tokens = normalized.split()
+    has_task_token = any(
+        max(
+            SequenceMatcher(None, token.removeprefix("ה"), candidate).ratio()
+            for candidate in ("משימה", "משימות")
+        )
+        >= 0.72
+        for token in tokens
+    )
+    navigation_cues = {"מה", "איזה", "אילו", "הצג", "תראה", "שלי", "פתוח", "פתוחות"}
+    resolution_cues = {"בוצע", "בוצעה", "סיימתי", "סיימנו", "בטל", "ביטול", "מחק"}
+    if has_task_token and (
+        navigation_cues.intersection(tokens) or resolution_cues.intersection(tokens)
+    ):
+        return "tasks"
     return None
 
 
@@ -130,8 +261,13 @@ class TelegramRuntime:
         self._reminder_service: ReminderService | None = None
         self._calendar_service: CalendarService | None = None
         self._confirmation_service: ConfirmationService | None = None
+        self._conversation_service: ConversationService | None = None
         self._morning_brief_service: MorningBriefService | None = None
         self._media_text_service: MediaTextService | None = None
+        self._whatsapp_service: WhatsAppService | None = None
+        self._last_visible_item_ids: dict[
+            str, tuple[Literal["task", "commitment"], list[uuid.UUID]]
+        ] = {}
         self._application = Application.builder().token(token).build()
         self._application.add_handler(CommandHandler("start", self._start_command))
         self._application.add_handler(CommandHandler("status", self._status_command))
@@ -145,6 +281,7 @@ class TelegramRuntime:
         self._application.add_handler(CommandHandler("help", self._help_command))
         self._application.add_handler(CommandHandler("reschedule", self._reschedule_command))
         self._application.add_handler(CommandHandler("resolve_time", self._resolve_time_command))
+        self._application.add_handler(CommandHandler("groups", self._groups_command))
         self._application.add_handler(CallbackQueryHandler(self._callback))
         self._application.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._ingest_text)
@@ -164,6 +301,8 @@ class TelegramRuntime:
         confirmation_service: "ConfirmationService | None" = None,
         morning_brief_service: "MorningBriefService | None" = None,
         media_text_service: "MediaTextService | None" = None,
+        whatsapp_service: "WhatsAppService | None" = None,
+        conversation_service: "ConversationService | None" = None,
     ) -> None:
         self._intake_service = intake_service
         self._reminder_service = reminder_service
@@ -171,6 +310,8 @@ class TelegramRuntime:
         self._confirmation_service = confirmation_service
         self._morning_brief_service = morning_brief_service
         self._media_text_service = media_text_service
+        self._whatsapp_service = whatsapp_service
+        self._conversation_service = conversation_service
 
     async def start(self) -> None:
         await self._application.initialize()
@@ -216,9 +357,9 @@ class TelegramRuntime:
         keyboard = InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("✅ בצע עכשיו", callback_data=f"execute:{approval_id}"),
+                    InlineKeyboardButton("✅ שמור משימה", callback_data=f"execute:{approval_id}"),
                     InlineKeyboardButton("✏️ שנה", callback_data=f"change:{approval_id}"),
-                    InlineKeyboardButton("🗑️ בטל", callback_data=f"cancel:{approval_id}"),
+                    InlineKeyboardButton("🗑️ אל תשמור", callback_data=f"cancel:{approval_id}"),
                 ]
             ]
         )
@@ -236,25 +377,28 @@ class TelegramRuntime:
         due_at: datetime,
         reminder_id: str | None = None,
     ) -> str:
-        keyboard = InlineKeyboardMarkup(
+        rows = [
             [
-                [
-                    InlineKeyboardButton("✅ בוצע", callback_data=f"done:{commitment_id}"),
-                    InlineKeyboardButton(
-                        "🧠 דחייה חכמה",
-                        callback_data=f"smart:{reminder_id}",
-                    ),
-                ],
-                [
-                    InlineKeyboardButton("🕓 בחר שעה", callback_data=f"choose:{commitment_id}"),
-                    InlineKeyboardButton("🗑️ בטל", callback_data=f"drop:{commitment_id}"),
-                ],
-                [
-                    InlineKeyboardButton("➕ 10 דקות", callback_data=f"quick:{reminder_id}:10"),
-                    InlineKeyboardButton("➕ שעה", callback_data=f"quick:{reminder_id}:60"),
-                ],
-            ]
-        )
+                InlineKeyboardButton("✅ סיימתי", callback_data=f"done:{commitment_id}"),
+                InlineKeyboardButton(
+                    "⏰ לא עכשיו",
+                    callback_data=f"smart:{reminder_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton("🕓 שעה אחרת", callback_data=f"choose:{commitment_id}"),
+                InlineKeyboardButton("🗑️ לא רלוונטי", callback_data=f"drop:{commitment_id}"),
+            ],
+            [
+                InlineKeyboardButton("➕ 10 דקות", callback_data=f"quick:{reminder_id}:10"),
+                InlineKeyboardButton("➕ שעה", callback_data=f"quick:{reminder_id}:60"),
+            ],
+        ]
+        if getattr(self, "_calendar_service", None) is not None:
+            rows.append(
+                [InlineKeyboardButton("🗓️ הוסף ליומן", callback_data=f"calendarize:{commitment_id}")]
+            )
+        keyboard = InlineKeyboardMarkup(rows)
         message = await self._application.bot.send_message(
             chat_id=self._primary_user_id,
             text=reminder_card(summary, due_at, self._timezone),
@@ -266,8 +410,8 @@ class TelegramRuntime:
         keyboard = InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("✅ אשר", callback_data=f"approve:{approval_id}"),
-                    InlineKeyboardButton("✖️ דחה", callback_data=f"reject:{approval_id}"),
+                    InlineKeyboardButton("✅ שמור", callback_data=f"approve:{approval_id}"),
+                    InlineKeyboardButton("🗑️ אל תשמור", callback_data=f"reject:{approval_id}"),
                 ]
             ]
         )
@@ -301,6 +445,40 @@ class TelegramRuntime:
         )
         return str(message.message_id)
 
+    async def detail_clarification_request(
+        self,
+        approval_id: str,
+        summary: str,
+        question: str,
+        options: tuple[str, ...],
+    ) -> str:
+        message = await self._application.bot.send_message(
+            chat_id=self._primary_user_id,
+            text=f"🤔 צריך עוד פרט\n━━━━━━━━━━━━\n{summary}\n\n❓ {question}",
+            reply_markup=self._detail_clarification_keyboard(uuid.UUID(approval_id), options),
+        )
+        return str(message.message_id)
+
+    @staticmethod
+    def _detail_clarification_keyboard(
+        approval_id: uuid.UUID, options: tuple[str, ...]
+    ) -> InlineKeyboardMarkup:
+        option_rows = [
+            [InlineKeyboardButton(option, callback_data=f"detail:{approval_id}:{index}")]
+            for index, option in enumerate(options)
+        ]
+        return InlineKeyboardMarkup(
+            [
+                *option_rows,
+                [
+                    InlineKeyboardButton(
+                        "✏️ אכתוב במילים שלי", callback_data=f"detailother:{approval_id}"
+                    ),
+                    InlineKeyboardButton("🗑️ בטל", callback_data=f"cancel:{approval_id}"),
+                ],
+            ]
+        )
+
     async def workflow_confirmation(self, message_id: str | None, text: str) -> str:
         if message_id is not None:
             await self._application.bot.edit_message_text(
@@ -328,6 +506,45 @@ class TelegramRuntime:
         message = await self._application.bot.send_message(
             chat_id=self._primary_user_id,
             text=timetable_card(summary),
+            reply_markup=keyboard,
+        )
+        return str(message.message_id)
+
+    async def group_tracking_request(self, conversation_id: str, display_name: str) -> str:
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ עקוב אחרי הקבוצה", callback_data=f"watch:{conversation_id}"
+                    ),
+                    InlineKeyboardButton("🔕 אל תעקוב", callback_data=f"unwatch:{conversation_id}"),
+                ]
+            ]
+        )
+        message = await self._application.bot.send_message(
+            chat_id=self._primary_user_id,
+            text=(
+                "👥 זוהתה קבוצת WhatsApp חדשה\n"
+                "━━━━━━━━━━━━\n"
+                f"📛 {display_name}\n\n"
+                "לעקוב אחרי תכנון פגישות ועדכונים על התחייבויות בקבוצה?"
+            ),
+            reply_markup=keyboard,
+        )
+        return str(message.message_id)
+
+    async def memory_request(self, approval_id: str, summary: str) -> str:
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("🧠 שמור", callback_data=f"remember:{approval_id}"),
+                    InlineKeyboardButton("✖️ אל תשמור", callback_data=f"forget:{approval_id}"),
+                ]
+            ]
+        )
+        message = await self._application.bot.send_message(
+            chat_id=self._primary_user_id,
+            text=f"🧠 זיכרון מוצע\n━━━━━━━━━━━━\n{summary}",
             reply_markup=keyboard,
         )
         return str(message.message_id)
@@ -375,7 +592,7 @@ class TelegramRuntime:
 
     async def _tasks_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
-        await self._render_rows(update, Task, "משימות", "title")
+        await self._render_task_cards(update)
 
     async def _calendar_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorized(update):
@@ -408,16 +625,150 @@ class TelegramRuntime:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         del context
-        await self._render_rows(update, Commitment, "התחייבויות", "summary")
+        await self._render_commitment_cards(update)
+
+    async def _render_commitment_cards(self, update: Update) -> None:
+        if not self._authorized(update):
+            await self._deny(update)
+            return
+        if update.message is None:
+            return
+        async with self._session_factory() as session:
+            commitments = list(
+                (
+                    await session.scalars(
+                        select(Commitment)
+                        .where(
+                            Commitment.status.not_in(
+                                [CommitmentStatus.DONE, CommitmentStatus.CANCELLED]
+                            )
+                        )
+                        .order_by(Commitment.due_at.is_(None), Commitment.due_at)
+                        .limit(11)
+                    )
+                ).all()
+            )
+            cards: list[tuple[Commitment, str]] = []
+            for commitment in commitments[:10]:
+                source_event = await session.get(Event, commitment.source_event_id)
+                calendar_action = await session.scalar(
+                    select(CalendarAction).where(CalendarAction.commitment_id == commitment.id)
+                )
+                cards.append(
+                    (
+                        commitment,
+                        self._commitment_detail(commitment, source_event, calendar_action),
+                    )
+                )
+        if not cards:
+            await update.message.reply_text("📋 התחייבויות\n━━━━━━━━━━━━\nאין התחייבויות פתוחות.")
+            return
+        chat = getattr(update, "effective_chat", None)
+        if chat is not None:
+            self._last_visible_item_ids[str(chat.id)] = (
+                "commitment",
+                [item.id for item, _card in cards],
+            )
+        lines = [
+            f"📋 ההתחייבויות הפתוחות ({len(cards)})"
+            + (" — מוצגות 10 הקרובות" if len(commitments) > 10 else ""),
+            "━━━━━━━━━━━━",
+        ]
+        keyboard_rows: list[list[InlineKeyboardButton]] = []
+        for index, (commitment, card) in enumerate(cards, start=1):
+            lines.append(f"{index}. {' '.join(card.split())[:260]}")
+            action_row = [
+                InlineKeyboardButton(f"✅ {index}", callback_data=f"done:{commitment.id}"),
+                InlineKeyboardButton(f"🗑️ {index}", callback_data=f"drop:{commitment.id}"),
+                InlineKeyboardButton(f"🕓 {index}", callback_data=f"choose:{commitment.id}"),
+            ]
+            if (
+                getattr(self, "_calendar_service", None) is not None
+                and commitment.due_at is not None
+            ):
+                action_row.append(
+                    InlineKeyboardButton(f"🗓️ {index}", callback_data=f"calendarize:{commitment.id}")
+                )
+            keyboard_rows.append(action_row)
+        lines.append("\nאפשר גם לכתוב: „תעיף את 2” או „סיימתי את 1”.")
+        await update.message.reply_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+        )
+
+    def _commitment_detail(
+        self,
+        commitment: Commitment,
+        source_event: Event | None,
+        calendar_action: CalendarAction | None,
+    ) -> str:
+        status_labels = {
+            CommitmentStatus.DETECTED: "ממתינה לשמירה",
+            CommitmentStatus.SCHEDULED: "מתוזמנת",
+            CommitmentStatus.OVERDUE: "באיחור",
+        }
+        due = (
+            commitment.due_at.astimezone(self._timezone).strftime("%d.%m.%Y בשעה %H:%M")
+            if commitment.due_at is not None
+            else "ללא מועד"
+        )
+        lines = [
+            f"📝 {commitment.summary}",
+            f"📅 {due}",
+            f"📌 סטטוס: {status_labels.get(commitment.status, commitment.status.value)}",
+        ]
+        if source_event is not None:
+            conversation_name = source_event.payload_json.get("conversation_display_name")
+            if isinstance(conversation_name, str) and conversation_name.strip():
+                lines.append(f"💬 מקור: WhatsApp עם {conversation_name.strip()}")
+            else:
+                lines.append(f"💬 מקור: {source_event.source.value}")
+        if calendar_action is not None:
+            calendar_labels = {
+                "executed": "נוסף ל־Google Calendar",
+                "pending": "ממתין לאישור Calendar",
+                "pending_configuration": "ממתין לחיבור Calendar",
+                "failed": "יצירת האירוע נכשלה",
+            }
+            lines.append(
+                "🗓️ "
+                + calendar_labels.get(calendar_action.status.value, calendar_action.status.value)
+            )
+        return "\n".join(lines)
 
     async def _memory_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
-        await self._render_rows(update, MemoryFact, "זיכרונות", "subject")
+        if not self._authorized(update):
+            await self._deny(update)
+            return
+        if update.message is None:
+            return
+        async with self._session_factory() as session:
+            memories = list(
+                (
+                    await session.scalars(
+                        select(MemoryFact)
+                        .where(MemoryFact.status == MemoryStatus.CONFIRMED)
+                        .order_by(MemoryFact.last_verified_at.desc())
+                        .limit(20)
+                    )
+                ).all()
+            )
+        if not memories:
+            await update.message.reply_text(
+                "🧠 זיכרונות\n━━━━━━━━━━━━\nאין עדיין זיכרונות מאושרים."
+            )
+            return
+        lines = [
+            f"• {memory.subject} — {memory.predicate}: {memory.value_json.get('value', '')}"
+            for memory in memories
+        ]
+        await update.message.reply_text("🧠 זיכרונות מאושרים\n━━━━━━━━━━━━\n" + "\n".join(lines))
 
     async def _render_rows(
         self,
         update: Update,
-        model: type[Task] | type[Commitment] | type[MemoryFact],
+        model: type[Commitment] | type[MemoryFact],
         title: str,
         field: str,
     ) -> None:
@@ -430,6 +781,64 @@ class TelegramRuntime:
             rows = list((await session.scalars(select(model).limit(20))).all())
         values = [f"• {getattr(row, field)}" for row in rows]
         await update.message.reply_text(f"{title}:\n" + ("\n".join(values) if values else "אין"))
+
+    async def _render_task_cards(self, update: Update) -> None:
+        """Render open tasks as one compact, actionable Telegram message."""
+
+        if not self._authorized(update):
+            await self._deny(update)
+            return
+        if update.message is None:
+            return
+        async with self._session_factory() as session:
+            tasks = list(
+                (
+                    await session.scalars(
+                        select(Task)
+                        .where(Task.status.not_in([TaskStatus.DONE, TaskStatus.CANCELLED]))
+                        .order_by(Task.due_at.is_(None), Task.due_at, Task.created_at)
+                        .limit(11)
+                    )
+                ).all()
+            )
+        visible_tasks = tasks[:10]
+        if not visible_tasks:
+            await update.message.reply_text("☑️ המשימות שלי\n━━━━━━━━━━━━\n✨ אין משימות פתוחות.")
+            return
+        chat = getattr(update, "effective_chat", None)
+        if chat is not None:
+            self._last_visible_item_ids[str(chat.id)] = (
+                "task",
+                [task.id for task in visible_tasks],
+            )
+
+        suffix = " — מוצגות 10 הקרובות" if len(tasks) > 10 else ""
+        lines = [f"☑️ המשימות הפתוחות ({len(visible_tasks)}){suffix}", "━━━━━━━━━━━━"]
+        rows: list[list[InlineKeyboardButton]] = []
+        for index, task in enumerate(visible_tasks, start=1):
+            due_text = (
+                f"🕓 {task.due_at.astimezone(self._timezone):%d.%m.%Y בשעה %H:%M}"
+                if task.due_at is not None
+                else "🕓 ללא מועד"
+            )
+            description = task.description.strip() if task.description else ""
+            details = f"\n   📎 {description[:120]}" if description else ""
+            lines.append(f"{index}. {task.title[:160]}\n   {due_text}{details}")
+            action_row = [
+                InlineKeyboardButton(f"✅ {index}", callback_data=f"done:{task.id}"),
+                InlineKeyboardButton(f"🗑️ {index}", callback_data=f"drop:{task.id}"),
+                InlineKeyboardButton(f"🕓 {index}", callback_data=f"choose:{task.id}"),
+            ]
+            if getattr(self, "_calendar_service", None) is not None and task.due_at is not None:
+                action_row.append(
+                    InlineKeyboardButton(f"🗓️ {index}", callback_data=f"calendarize:{task.id}")
+                )
+            rows.append(action_row)
+        lines.append("\nאפשר גם לכתוב: „תעיף את 2” או „סיימתי את 1”.")
+        await update.message.reply_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
 
     async def _pause_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
@@ -456,6 +865,50 @@ class TelegramRuntime:
             return
         if update.message is not None:
             await update.message.reply_text(self._help_text())
+
+    async def _groups_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        del context
+        if not self._authorized(update):
+            await self._deny(update)
+            return
+        if update.message is None:
+            return
+        async with self._session_factory() as session:
+            groups = list(
+                (
+                    await session.scalars(
+                        select(WhatsAppConversation)
+                        .where(
+                            WhatsAppConversation.chat_type == WhatsAppConversationType.GROUP,
+                            WhatsAppConversation.ignored.is_(False),
+                        )
+                        .order_by(WhatsAppConversation.display_name)
+                    )
+                ).all()
+            )
+        if not groups:
+            await update.message.reply_text("לא נמצאו עדיין קבוצות WhatsApp.")
+            return
+        lines = ["👥 מעקב קבוצות WhatsApp", "━━━━━━━━━━━━"]
+        buttons: list[list[InlineKeyboardButton]] = []
+        for group in groups:
+            label = group.display_name or group.external_chat_id
+            status = "פעיל ✅" if group.tracking_enabled else "כבוי 🔕"
+            lines.append(f"• {label} — {status}")
+            action = "unwatch" if group.tracking_enabled else "watch"
+            button_label = f"🔕 הפסק: {label}" if group.tracking_enabled else f"✅ עקוב: {label}"
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        button_label[:60],
+                        callback_data=f"{action}:{group.id}",
+                    )
+                ]
+            )
+        await update.message.reply_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
 
     async def _reschedule_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorized(update):
@@ -508,6 +961,18 @@ class TelegramRuntime:
             await query.answer("פעולה לא תקינה", show_alert=True)
             return
         handled = False
+        if action in {"watch", "unwatch"} and self._whatsapp_service is not None:
+            group_label = await self._whatsapp_service.set_group_tracking(
+                target_id,
+                enabled=action == "watch",
+            )
+            if group_label is None:
+                await query.answer("הקבוצה לא נמצאה או שכבר אינה זמינה.", show_alert=True)
+                return
+            state = "הופעל" if action == "watch" else "הופסק"
+            await query.answer("בוצע")
+            await query.edit_message_text(f"✅ המעקב {state} עבור הקבוצה: {group_label}")
+            return
         if action == "cancel" and self._reminder_service is not None:
             handled = await self._reminder_service.cancel_pending_action(target_id)
         elif action == "execute" and self._reminder_service is not None:
@@ -525,6 +990,31 @@ class TelegramRuntime:
             handled = await self._confirmation_service.resolve(
                 target_id, approve=action == "confirm"
             )
+        elif action in {"remember", "forget"} and self._conversation_service is not None:
+            handled = await self._conversation_service.resolve_memory(
+                target_id, remember=action == "remember"
+            )
+        elif action == "detail" and len(parts) == 3 and self._intake_service is not None:
+            async with self._session_factory() as session:
+                approval = await session.get(ApprovalRequest, target_id)
+            try:
+                option_index = int(parts[2])
+                item_payload = approval.action_payload["item"] if approval is not None else {}
+                _, options = self._intake_service._detail_prompt(item_payload)
+                answer = options[option_index]
+            except (ValueError, IndexError, KeyError, TypeError):
+                await query.answer("האפשרות כבר אינה זמינה", show_alert=True)
+                return
+            try:
+                resolution = await self._intake_service.refine_approval(target_id, answer)
+            except LLMRetryableError as exc:
+                await query.answer(retryable_llm_message(exc), show_alert=True)
+                return
+            await self._render_detail_resolution(query, target_id, resolution)
+            return
+        elif action == "detailother" and self._intake_service is not None:
+            await self._request_manual_time(query, target_id, kind="detail")
+            return
         elif action == "pick" and len(parts) == 3 and self._confirmation_service is not None:
             try:
                 hour = int(parts[2])
@@ -538,6 +1028,28 @@ class TelegramRuntime:
             handled = await self._reminder_service.mark_done(target_id)
         elif action == "drop" and self._reminder_service is not None:
             handled = await self._reminder_service.cancel_commitment(target_id)
+        elif action == "calendarize":
+            if self._calendar_service is None:
+                await query.answer("Google Calendar עדיין לא מחובר.", show_alert=True)
+                return
+            try:
+                calendar_result = await self._calendar_service.add_item_to_calendar(target_id)
+            except Exception:
+                logger.exception("telegram_calendarize_item_failed")
+                await query.answer("לא הצלחתי להוסיף ליומן. אפשר לנסות שוב.", show_alert=True)
+                return
+            messages = {
+                "created": "נוסף ל־Google Calendar ✅",
+                "already_exists": "הפריט כבר נמצא ביומן.",
+                "untimed": "צריך קודם לקבוע מועד לפריט.",
+                "closed": "הפריט כבר סגור.",
+                "missing": "הפריט לא נמצא.",
+            }
+            await query.answer(
+                messages[calendar_result],
+                show_alert=calendar_result not in {"created", "already_exists"},
+            )
+            return
         elif action == "smart" and self._reminder_service is not None:
             handled = await self._reminder_service.smart_snooze(target_id)
         elif action == "quick" and len(parts) == 3 and self._reminder_service is not None:
@@ -556,6 +1068,13 @@ class TelegramRuntime:
             return
         elif action == "choose":
             await self._show_reminder_time_picker(query, target_id)
+            return
+        elif action in {"manualapproval", "manualitem"}:
+            await self._request_manual_time(
+                query,
+                target_id,
+                kind="approval" if action == "manualapproval" else "item",
+            )
             return
         elif action == "reschedule" and len(parts) == 3 and self._reminder_service is not None:
             try:
@@ -612,8 +1131,8 @@ class TelegramRuntime:
         if handled:
             title = {
                 "done": "✅ סומן כבוצע",
-                "drop": "🗑️ התזכורת בוטלה",
-                "smart": "🧠 התזכורת נדחתה לזמן מתאים יותר",
+                "drop": "🗑️ הוסר כלא רלוונטי (לא סומן כבוצע)",
+                "smart": "⏰ התזכורת נדחתה לזמן מתאים יותר",
                 "reschedule": "🕓 המועד עודכן",
             }.get(action, "✅ הפעולה טופלה")
             if action == "quick":
@@ -633,8 +1152,28 @@ class TelegramRuntime:
             if reminder.telegram_message_id is not None
         }
         current_message_id = getattr(query.message, "message_id", None)
-        if current_message_id is not None:
+        current_text = getattr(query.message, "text", "") or ""
+        is_compact_dashboard = current_text.startswith(
+            ("☑️ המשימות הפתוחות", "📋 ההתחייבויות הפתוחות")
+        )
+        if current_message_id is not None and not is_compact_dashboard:
             message_ids.add(str(current_message_id))
+        elif is_compact_dashboard:
+            markup = getattr(query.message, "reply_markup", None)
+            remaining_rows = [
+                row
+                for row in getattr(markup, "inline_keyboard", [])
+                if not any((button.callback_data or "").endswith(f":{item_id}") for button in row)
+            ]
+            try:
+                await query.edit_message_reply_markup(
+                    reply_markup=InlineKeyboardMarkup(remaining_rows) if remaining_rows else None
+                )
+            except TelegramError as exc:
+                logger.warning(
+                    "telegram_dashboard_update_failed",
+                    extra={"error_type": type(exc).__name__},
+                )
 
         for message_id in message_ids:
             try:
@@ -676,7 +1215,12 @@ class TelegramRuntime:
                     )
                     for hour in hours
                 ],
-                [InlineKeyboardButton("🗑️ בטל", callback_data=f"cancel:{approval_id}")],
+                [
+                    InlineKeyboardButton(
+                        "⌨️ כתוב שעה", callback_data=f"manualapproval:{approval_id}"
+                    ),
+                    InlineKeyboardButton("🗑️ בטל", callback_data=f"cancel:{approval_id}"),
+                ],
             ]
         )
         await query.answer()
@@ -713,7 +1257,10 @@ class TelegramRuntime:
                     )
                     for hour in hours
                 ],
-                [InlineKeyboardButton("🗑️ בטל", callback_data=f"drop:{commitment_id}")],
+                [
+                    InlineKeyboardButton("⌨️ כתוב שעה", callback_data=f"manualitem:{commitment_id}"),
+                    InlineKeyboardButton("🗑️ בטל", callback_data=f"drop:{commitment_id}"),
+                ],
             ]
         )
         await query.answer()
@@ -742,6 +1289,299 @@ class TelegramRuntime:
             selected += timedelta(days=1)
         return await self._reminder_service.reschedule(commitment_id, selected)
 
+    async def _request_manual_time(
+        self,
+        query: CallbackQuery,
+        target_id: uuid.UUID,
+        *,
+        kind: Literal["approval", "item", "detail"],
+    ) -> None:
+        await query.answer()
+        is_detail = kind == "detail"
+        prompt = await self._application.bot.send_message(
+            chat_id=self._primary_user_id,
+            text=(
+                "✏️ פירוט במילים שלך\n━━━━━━━━━━━━\nכתוב בתגובה להודעה הזאת את הפרט החסר."
+                if is_detail
+                else "⌨️ כתיבת שעה ידנית\n"
+                "━━━━━━━━━━━━\n"
+                "כתוב שעה בתגובה להודעה הזאת.\n"
+                "דוגמאות: 19:30, מחר 08:15, 04.08 17:45"
+            ),
+            reply_markup=ForceReply(
+                selective=True,
+                input_field_placeholder=("אפשר לפרט כאן" if is_detail else "לדוגמה: 19:30"),
+            ),
+        )
+        effective_at = utc_now()
+        async with self._session_factory() as session:
+            session.add(
+                Event(
+                    source=EventSource.TELEGRAM,
+                    source_account=str(self._application.bot.id),
+                    external_id=str(prompt.message_id),
+                    event_type="manual_time.prompt",
+                    direction=EventDirection.OUTBOUND,
+                    occurred_at=effective_at,
+                    received_at=effective_at,
+                    actor_external_id="personal-agent",
+                    actor_display_name="Personal Agent",
+                    conversation_external_id=str(self._primary_user_id),
+                    content_text="Manual time requested",
+                    payload_json={"kind": kind, "target_id": str(target_id)},
+                    dedupe_key=f"telegram:manual_time_prompt:{prompt.message_id}",
+                    sensitivity=Sensitivity.PERSONAL,
+                    processing_status=ProcessingStatus.PENDING,
+                )
+            )
+            await session.commit()
+
+    async def _handle_manual_time_reply(self, message: Message, conversation_id: str) -> bool:
+        replied_to = getattr(message, "reply_to_message", None)
+        prompt_message_id = getattr(replied_to, "message_id", None)
+        if prompt_message_id is None or not message.text:
+            return False
+        async with self._session_factory() as session:
+            prompt = await session.scalar(
+                select(Event).where(
+                    Event.source == EventSource.TELEGRAM,
+                    Event.event_type == "manual_time.prompt",
+                    Event.external_id == str(prompt_message_id),
+                    Event.conversation_external_id == conversation_id,
+                    Event.processing_status == ProcessingStatus.PENDING,
+                )
+            )
+            if prompt is None:
+                return False
+            kind = prompt.payload_json.get("kind")
+            try:
+                target_id = uuid.UUID(str(prompt.payload_json["target_id"]))
+            except (KeyError, ValueError):
+                prompt.processing_status = ProcessingStatus.FAILED
+                await session.commit()
+                return False
+            prompt_record_id = prompt.id
+            base_date = await self._manual_time_base_date(session, kind, target_id)
+
+        if kind == "detail" and self._intake_service is not None:
+            try:
+                resolution = await self._intake_service.refine_approval(target_id, message.text)
+            except LLMRetryableError as exc:
+                await message.reply_text(retryable_llm_message(exc))
+                return True
+            handled = resolution.state != "inactive"
+            async with self._session_factory() as session:
+                stored_prompt = await session.get(Event, prompt_record_id)
+                if stored_prompt is not None:
+                    stored_prompt.processing_status = (
+                        ProcessingStatus.PROCESSED if handled else ProcessingStatus.FAILED
+                    )
+                    stored_prompt.payload_json = {
+                        **stored_prompt.payload_json,
+                        "response_message_id": message.message_id,
+                    }
+                    await session.commit()
+            await self._reply_detail_resolution(message, target_id, resolution)
+            return True
+
+        try:
+            selected = self._parse_manual_datetime(message.text, base_date, utc_now())
+        except ValueError:
+            await message.reply_text(
+                "לא הצלחתי להבין את השעה. כתוב למשל `19:30`, `מחר 08:15` או `04.08 17:45`.",
+                parse_mode="Markdown",
+            )
+            return True
+
+        handled = False
+        if kind == "approval" and self._confirmation_service is not None:
+            handled = await self._confirmation_service.resolve_time(target_id, selected)
+        elif kind == "item" and self._reminder_service is not None:
+            handled = await self._reminder_service.reschedule(target_id, selected)
+
+        async with self._session_factory() as session:
+            stored_prompt = await session.get(Event, prompt_record_id)
+            if stored_prompt is not None:
+                stored_prompt.processing_status = (
+                    ProcessingStatus.PROCESSED if handled else ProcessingStatus.FAILED
+                )
+                stored_prompt.payload_json = {
+                    **stored_prompt.payload_json,
+                    "selected_at": selected.isoformat(),
+                    "response_message_id": message.message_id,
+                }
+                await session.commit()
+        if handled:
+            await message.reply_text(
+                f"✅ השעה עודכנה ל־{selected.astimezone(self._timezone):%d.%m.%Y בשעה %H:%M}."
+            )
+        else:
+            await message.reply_text("הבקשה כבר טופלה או שאינה פעילה.")
+        return True
+
+    async def _render_detail_resolution(
+        self, query: CallbackQuery, approval_id: uuid.UUID, resolution: object
+    ) -> None:
+        state = getattr(resolution, "state", "inactive")
+        summary = getattr(resolution, "summary", "")
+        if state == "executed":
+            await query.answer("הפרט הושלם וההתחייבות נשמרה")
+            return
+        if state == "question":
+            question = getattr(resolution, "question", None) or "אפשר לפרט עוד?"
+            options = tuple(getattr(resolution, "options", ()))
+            await query.answer()
+            await query.edit_message_text(
+                f"🤔 צריך עוד פרט\n━━━━━━━━━━━━\n{summary}\n\n❓ {question}",
+                reply_markup=self._detail_clarification_keyboard(approval_id, options),
+            )
+            return
+        if state == "time":
+            await self._show_approval_time_picker(query, approval_id)
+            return
+        if state == "confirmation":
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("✅ אשר", callback_data=f"confirm:{approval_id}"),
+                        InlineKeyboardButton("✖️ דחה", callback_data=f"decline:{approval_id}"),
+                    ]
+                ]
+            )
+            await query.answer()
+            await query.edit_message_text(approval_card(summary), reply_markup=keyboard)
+            return
+        await query.answer("הבקשה כבר טופלה או פגה", show_alert=True)
+
+    async def _reply_detail_resolution(
+        self, message: Message, approval_id: uuid.UUID, resolution: object
+    ) -> None:
+        state = getattr(resolution, "state", "inactive")
+        summary = getattr(resolution, "summary", "")
+        if state == "executed":
+            await message.reply_text("✅ הפרט הושלם וההתחייבות נשמרה.")
+        elif state == "question":
+            question = getattr(resolution, "question", None) or "אפשר לפרט עוד?"
+            options = tuple(getattr(resolution, "options", ()))
+            await message.reply_text(
+                f"🤔 צריך עוד פרט\n━━━━━━━━━━━━\n{summary}\n\n❓ {question}",
+                reply_markup=self._detail_clarification_keyboard(approval_id, options),
+            )
+        elif state == "time":
+            await message.reply_text(
+                "🕓 נשאר לבחור שעה.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("בחר שעה", callback_data=f"change:{approval_id}")]]
+                ),
+            )
+        elif state == "confirmation":
+            await message.reply_text(
+                approval_card(summary),
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton("✅ אשר", callback_data=f"confirm:{approval_id}"),
+                            InlineKeyboardButton("✖️ דחה", callback_data=f"decline:{approval_id}"),
+                        ]
+                    ]
+                ),
+            )
+        else:
+            await message.reply_text("הבקשה כבר טופלה או פגה.")
+
+    async def _manual_time_base_date(
+        self,
+        session: AsyncSession,
+        kind: object,
+        target_id: uuid.UUID,
+    ) -> date | None:
+        value: object = None
+        explicit_date: object = None
+        if kind == "approval":
+            approval = await session.get(ApprovalRequest, target_id)
+            if approval is not None:
+                item = approval.action_payload.get("item")
+                if isinstance(item, dict):
+                    value = item.get("due_at")
+                    explicit_date = item.get("explicit_date")
+        elif kind == "item":
+            commitment = await session.get(Commitment, target_id)
+            task = await session.get(Task, target_id) if commitment is None else None
+            value = commitment.due_at if commitment is not None else task.due_at if task else None
+        if isinstance(value, datetime):
+            return value.astimezone(self._timezone).date()
+        if isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=self._timezone)
+                return parsed.astimezone(self._timezone).date()
+            except ValueError:
+                pass
+        if isinstance(explicit_date, str):
+            try:
+                return date.fromisoformat(explicit_date)
+            except ValueError:
+                pass
+        return None
+
+    def _parse_manual_datetime(
+        self,
+        value: str,
+        base_date: date | None,
+        reference_at: datetime,
+    ) -> datetime:
+        text = " ".join(value.strip().split())
+        local_now = reference_at.astimezone(self._timezone)
+        iso_candidate = text.replace(" ", "T", 1)
+        if re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{1,2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?", iso_candidate
+        ):
+            parsed = datetime.fromisoformat(iso_candidate.replace("Z", "+00:00"))
+            return parsed.replace(tzinfo=self._timezone) if parsed.tzinfo is None else parsed
+
+        dated = re.fullmatch(
+            r"(?P<day>\d{1,2})[./](?P<month>\d{1,2})(?:[./](?P<year>\d{4}))?\s+"
+            r"(?P<hour>\d{1,2})[:.](?P<minute>\d{2})",
+            text,
+        )
+        if dated:
+            year = int(dated.group("year") or local_now.year)
+            selected = datetime(
+                year,
+                int(dated.group("month")),
+                int(dated.group("day")),
+                int(dated.group("hour")),
+                int(dated.group("minute")),
+                tzinfo=self._timezone,
+            )
+            if dated.group("year") is None and selected <= local_now:
+                selected = selected.replace(year=year + 1)
+            return selected
+
+        clock = re.fullmatch(
+            r"(?:(?P<day_word>היום|מחר)\s+)?(?P<hour>\d{1,2})[:.](?P<minute>\d{2})",
+            text,
+        )
+        if clock is None:
+            raise ValueError("Manual time is not recognized")
+        hour = int(clock.group("hour"))
+        minute = int(clock.group("minute"))
+        if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+            raise ValueError("Manual time is outside the valid clock range")
+        day_word = clock.group("day_word")
+        selected_date = (
+            local_now.date() + timedelta(days=1)
+            if day_word == "מחר"
+            else local_now.date()
+            if day_word == "היום"
+            else base_date or local_now.date()
+        )
+        selected = datetime.combine(selected_date, time(hour, minute), self._timezone)
+        if day_word is None and selected <= local_now:
+            selected += timedelta(days=1)
+        return selected
+
     async def _status_text(self) -> str:
         async with self._session_factory() as session:
             tasks = await session.scalar(select(func.count()).select_from(Task))
@@ -759,6 +1599,7 @@ class TelegramRuntime:
     @staticmethod
     def _help_text() -> str:
         return (
+            "👥 /groups — ניהול מעקב אחרי קבוצות WhatsApp\n\n"
             "💬 אפשר פשוט לכתוב לי בעברית\n━━━━━━━━━━━━\n"
             "• מה יש היום?\n"
             "• מה ביומן?\n"
@@ -773,6 +1614,10 @@ class TelegramRuntime:
         content = text or (message.text if message is not None else None)
         if message is None or not content:
             return False
+        item_resolution = classify_item_resolution(content)
+        if item_resolution is not None:
+            await self._resolve_spoken_item(update, item_resolution)
+            return True
         intent = classify_spoken_intent(content)
         if intent is None:
             return False
@@ -800,16 +1645,209 @@ class TelegramRuntime:
             await message.reply_text("\n".join(lines))
             return True
         if intent == "tasks":
-            await self._render_rows(update, Task, "☑️ המשימות שלי", "title")
+            await self._render_task_cards(update)
             return True
         if intent == "commitments":
-            await self._render_rows(update, Commitment, "📌 מה פתוח", "summary")
+            await self._render_commitment_cards(update)
             return True
         if intent == "status":
             await message.reply_text(await self._status_text())
             return True
         await message.reply_text(self._help_text())
         return True
+
+    async def _resolve_spoken_item(self, update: Update, resolution: SpokenItemResolution) -> None:
+        message = update.message
+        chat = update.effective_chat
+        if message is None or chat is None or self._reminder_service is None:
+            return
+        async with self._session_factory() as session:
+            commitments = list(
+                (
+                    await session.scalars(
+                        select(Commitment)
+                        .where(
+                            Commitment.status.not_in(
+                                [CommitmentStatus.DONE, CommitmentStatus.CANCELLED]
+                            )
+                        )
+                        .order_by(
+                            Commitment.due_at.is_(None),
+                            Commitment.due_at,
+                            Commitment.created_at,
+                        )
+                        .limit(20)
+                    )
+                ).all()
+            )
+            tasks = list(
+                (
+                    await session.scalars(
+                        select(Task)
+                        .where(Task.status == TaskStatus.PENDING)
+                        .order_by(Task.due_at.is_(None), Task.due_at, Task.created_at)
+                        .limit(20)
+                    )
+                ).all()
+            )
+            closed_commitments = list(
+                (
+                    await session.scalars(
+                        select(Commitment)
+                        .where(
+                            Commitment.status.in_(
+                                [CommitmentStatus.DONE, CommitmentStatus.CANCELLED]
+                            )
+                        )
+                        .order_by(Commitment.updated_at.desc())
+                        .limit(20)
+                    )
+                ).all()
+            )
+            closed_tasks = list(
+                (
+                    await session.scalars(
+                        select(Task)
+                        .where(Task.status.in_([TaskStatus.DONE, TaskStatus.CANCELLED]))
+                        .order_by(Task.updated_at.desc())
+                        .limit(20)
+                    )
+                ).all()
+            )
+            recent_replies = list(
+                (
+                    await session.scalars(
+                        select(Event)
+                        .where(
+                            Event.source == EventSource.TELEGRAM,
+                            Event.direction == EventDirection.OUTBOUND,
+                            Event.event_type == "assistant.reply",
+                            Event.conversation_external_id == str(chat.id),
+                            Event.content_text.is_not(None),
+                        )
+                        .order_by(Event.occurred_at.desc())
+                        .limit(10)
+                    )
+                ).all()
+            )
+
+        active_items = [
+            (commitment.id, commitment.summary, "active") for commitment in commitments
+        ] + [(task.id, task.title, "active") for task in tasks]
+        reference_items = [
+            *active_items,
+            *[
+                (commitment.id, commitment.summary, commitment.status.value)
+                for commitment in closed_commitments
+            ],
+            *[(task.id, task.title, task.status.value) for task in closed_tasks],
+        ]
+        if resolution.item_kind == "task":
+            active_items = [(task.id, task.title, "active") for task in tasks]
+            reference_items = [
+                *active_items,
+                *[(task.id, task.title, task.status.value) for task in closed_tasks],
+            ]
+        elif resolution.item_kind == "commitment":
+            active_items = [
+                (commitment.id, commitment.summary, "active") for commitment in commitments
+            ]
+            reference_items = [
+                *active_items,
+                *[
+                    (commitment.id, commitment.summary, commitment.status.value)
+                    for commitment in closed_commitments
+                ],
+            ]
+        target: tuple[uuid.UUID, str, str] | None = None
+        if resolution.ordinal is not None:
+            last_visible_kind, last_visible_ids = getattr(self, "_last_visible_item_ids", {}).get(
+                str(chat.id), (None, [])
+            )
+            kind_matches = resolution.item_kind in {None, last_visible_kind}
+            if kind_matches and resolution.ordinal <= len(last_visible_ids):
+                visible_id = last_visible_ids[resolution.ordinal - 1]
+                target = next(
+                    (item for item in reference_items if item[0] == visible_id),
+                    None,
+                )
+            for reply in recent_replies:
+                if target is not None:
+                    break
+                reply_text = self._normalize_item_reference(reply.content_text or "")
+                displayed = sorted(
+                    (
+                        position,
+                        item_id,
+                        title,
+                        state,
+                    )
+                    for item_id, title, state in reference_items
+                    if (position := reply_text.find(self._normalize_item_reference(title))) >= 0
+                )
+                if resolution.ordinal <= len(displayed):
+                    _, item_id, title, state = displayed[resolution.ordinal - 1]
+                    target = (item_id, title, state)
+                    break
+        elif resolution.title_hint:
+            normalized_hint = self._normalize_item_reference(resolution.title_hint)
+            ranked = sorted(
+                (
+                    max(
+                        SequenceMatcher(
+                            None, normalized_hint, self._normalize_item_reference(title)
+                        ).ratio(),
+                        1.0 if normalized_hint in self._normalize_item_reference(title) else 0.0,
+                    ),
+                    item_id,
+                    title,
+                    state,
+                )
+                for item_id, title, state in reference_items
+            )
+            if ranked and ranked[-1][0] >= 0.60:
+                score, item_id, title, state = ranked[-1]
+                second_score = ranked[-2][0] if len(ranked) > 1 else 0.0
+                if len(ranked) == 1 or score - second_score >= 0.08:
+                    target = (item_id, title, state)
+
+        if target is None:
+            verb = "סמן כבוצע" if resolution.action == "done" else "בטל"
+            callback_action = "done" if resolution.action == "done" else "drop"
+            options = [
+                [
+                    InlineKeyboardButton(
+                        f"{verb}: {title[:32]}",
+                        callback_data=f"{callback_action}:{item_id}",
+                    )
+                ]
+                for item_id, title, _state in active_items[:4]
+            ]
+            await message.reply_text(
+                "לא ברור לי לאיזה פריט התכוונת. בחר פריט או כתוב את שמו:",
+                reply_markup=InlineKeyboardMarkup(options) if options else None,
+            )
+            return
+
+        item_id, title, state = target
+        if state != "active":
+            state_label = "כבר סומן כבוצע" if state == "done" else "כבר בוטל"
+            await message.reply_text(f"ℹ️ הפריט „{title}” {state_label}. לא שיניתי פריטים אחרים.")
+            return
+        handled = (
+            await self._reminder_service.mark_done(item_id)
+            if resolution.action == "done"
+            else await self._reminder_service.cancel_commitment(item_id)
+        )
+        if handled:
+            result = "סומן כבוצע" if resolution.action == "done" else "בוטל"
+            await message.reply_text(f"✅ הפריט „{title}” {result}. שאר הרשימה לא השתנתה.")
+        else:
+            await message.reply_text("הפריט כבר טופל או שאינו פעיל.")
+
+    @staticmethod
+    def _normalize_item_reference(value: str) -> str:
+        return " ".join(re.sub(r"[^\w\s]", " ", value.casefold()).split())
 
     def _media_descriptor(self, message: Message) -> tuple[str, str, str, str, int | None] | None:
         if message.voice is not None:
@@ -896,6 +1934,16 @@ class TelegramRuntime:
                 "📎 לא הצלחתי לקרוא את הקובץ. נתמכים: הקלטה, PDF, DOCX, TXT ותמונה."
             )
             return
+        except LLMRetryableError as exc:
+            logger.warning(
+                "telegram_gemini_temporarily_unavailable",
+                extra={
+                    "error_type": type(exc).__name__,
+                    "retry_after_seconds": exc.retry_after_seconds,
+                },
+            )
+            await message.reply_text(retryable_llm_message(exc))
+            return
         except Exception:
             logger.exception("telegram_media_extraction_failed")
             await message.reply_text("⚠️ לא הצלחתי לעבד את הקובץ כרגע. אפשר לנסות שוב מאוחר יותר.")
@@ -908,32 +1956,49 @@ class TelegramRuntime:
 
         caption = message.caption.strip() if message.caption else ""
         source_text = f"{caption}\n{extracted_text}".strip()
-        result = await self._intake_service.ingest(
-            NormalizedEvent(
-                source=EventSource.TELEGRAM,
-                source_account=str(self._application.bot.id),
-                external_id=str(message.message_id),
-                event_type=event_type,
-                direction=EventDirection.INBOUND,
-                occurred_at=message.date,
-                received_at=utc_now(),
-                actor_external_id=str(user.id),
-                actor_display_name=user.full_name,
-                conversation_external_id=str(chat.id),
-                content_text=source_text,
-                payload_json={
-                    "message_id": message.message_id,
-                    "chat_id": chat.id,
-                    "file_unique_id": file_unique_id,
-                    "filename": filename,
-                    "mime_type": mime_type,
-                    "size": len(content),
-                },
-                dedupe_key=dedupe_key,
+        try:
+            result = await self._intake_service.ingest(
+                NormalizedEvent(
+                    source=EventSource.TELEGRAM,
+                    source_account=str(self._application.bot.id),
+                    external_id=str(message.message_id),
+                    event_type=event_type,
+                    direction=EventDirection.INBOUND,
+                    occurred_at=message.date,
+                    received_at=utc_now(),
+                    actor_external_id=str(user.id),
+                    actor_display_name=user.full_name,
+                    conversation_external_id=str(chat.id),
+                    content_text=source_text,
+                    payload_json={
+                        "message_id": message.message_id,
+                        "chat_id": chat.id,
+                        "file_unique_id": file_unique_id,
+                        "filename": filename,
+                        "mime_type": mime_type,
+                        "size": len(content),
+                    },
+                    dedupe_key=dedupe_key,
+                )
             )
-        )
-        if result.created and not result.approval_ids:
-            await message.reply_text(NO_ACTION_MESSAGE)
+            if result.created and not result.approval_ids:
+                if self._conversation_service is None:
+                    await message.reply_text(NO_ACTION_MESSAGE)
+                    return
+                await self._conversation_service.respond(
+                    uuid.UUID(result.event_id),
+                    str(chat.id),
+                    source_text,
+                )
+        except LLMRetryableError as exc:
+            logger.warning(
+                "telegram_gemini_temporarily_unavailable",
+                extra={
+                    "error_type": type(exc).__name__,
+                    "retry_after_seconds": exc.retry_after_seconds,
+                },
+            )
+            await message.reply_text(retryable_llm_message(exc))
 
     async def _ingest_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
@@ -945,6 +2010,8 @@ class TelegramRuntime:
         chat = update.effective_chat
         if message is None or user is None or chat is None or not message.text:
             return
+        if await self._handle_manual_time_reply(message, str(chat.id)):
+            return
         if await self._handle_spoken_request(update):
             return
         if self._control.paused:
@@ -953,22 +2020,39 @@ class TelegramRuntime:
         if self._intake_service is None:
             await message.reply_text("שירות הקליטה עדיין לא מוכן.")
             return
-        result = await self._intake_service.ingest(
-            NormalizedEvent(
-                source=EventSource.TELEGRAM,
-                source_account=str(self._application.bot.id),
-                external_id=str(message.message_id),
-                event_type="message.received",
-                direction=EventDirection.INBOUND,
-                occurred_at=message.date,
-                received_at=utc_now(),
-                actor_external_id=str(user.id),
-                actor_display_name=user.full_name,
-                conversation_external_id=str(chat.id),
-                content_text=message.text,
-                payload_json={"message_id": message.message_id, "chat_id": chat.id},
-                dedupe_key=f"{chat.id}:message.received:{message.message_id}",
+        try:
+            result = await self._intake_service.ingest(
+                NormalizedEvent(
+                    source=EventSource.TELEGRAM,
+                    source_account=str(self._application.bot.id),
+                    external_id=str(message.message_id),
+                    event_type="message.received",
+                    direction=EventDirection.INBOUND,
+                    occurred_at=message.date,
+                    received_at=utc_now(),
+                    actor_external_id=str(user.id),
+                    actor_display_name=user.full_name,
+                    conversation_external_id=str(chat.id),
+                    content_text=message.text,
+                    payload_json={"message_id": message.message_id, "chat_id": chat.id},
+                    dedupe_key=f"{chat.id}:message.received:{message.message_id}",
+                )
             )
-        )
-        if result.created and not result.approval_ids:
-            await message.reply_text(NO_ACTION_MESSAGE)
+            if result.created and not result.approval_ids:
+                if self._conversation_service is None:
+                    await message.reply_text(NO_ACTION_MESSAGE)
+                    return
+                await self._conversation_service.respond(
+                    uuid.UUID(result.event_id),
+                    str(chat.id),
+                    message.text,
+                )
+        except LLMRetryableError as exc:
+            logger.warning(
+                "telegram_gemini_temporarily_unavailable",
+                extra={
+                    "error_type": type(exc).__name__,
+                    "retry_after_seconds": exc.retry_after_seconds,
+                },
+            )
+            await message.reply_text(retryable_llm_message(exc))

@@ -335,16 +335,14 @@ async def test_calendar_meeting_and_selected_recurring_rows_are_idempotent(
         first_approval = uuid.UUID(cast(list[str], first["approval_ids"])[0])
         factory = cast(async_sessionmaker[AsyncSession], app.state.session_factory)
         async with factory() as session:
-            action = (await session.scalars(select(CalendarAction))).one()
-            assert action.status is CalendarActionStatus.PENDING
-        service = cast(ReminderService, app.state.reminder_service)
-        assert await service.execute_pending_action_now(first_approval) is True
-        assert await service.execute_pending_action_now(first_approval) is False
+            assert await session.scalar(select(func.count()).select_from(CalendarAction)) == 0
+        confirmations = cast(ConfirmationService, app.state.confirmation_service)
+        assert await confirmations.resolve(first_approval, approve=True) is True
+        assert await confirmations.resolve(first_approval, approve=True) is False
         assert len(calendar.events) == 1
 
         second = await shortcut_post(client, "course timetable", fixed_now + timedelta(seconds=1))
         second_approval = uuid.UUID(cast(list[str], second["approval_ids"])[0])
-        confirmations = cast(ConfirmationService, app.state.confirmation_service)
         assert await confirmations.resolve(second_approval, approve=True) is True
         assert await confirmations.resolve(second_approval, approve=True) is False
         assert len(calendar.events) == 2
@@ -415,11 +413,11 @@ async def test_assignment_task_gets_durable_reminders_and_calendar_action(
     app = milestone_app(tmp_path, fixed_now, llm, calendar=calendar)
     async for client in client_for_app(app):
         body = await shortcut_post(client, "submit assignment 4", fixed_now)
-        assert len(cast(list[str], body["task_ids"])) == 1
+        assert cast(list[str], body["task_ids"]) == []
         approval_id = uuid.UUID(cast(list[str], body["approval_ids"])[0])
-        service = cast(ReminderService, app.state.reminder_service)
         assert calendar.events == []
-        assert await service.execute_pending_action_now(approval_id) is True
+        confirmations = cast(ConfirmationService, app.state.confirmation_service)
+        assert await confirmations.resolve(approval_id, approve=True) is True
         factory = cast(async_sessionmaker[AsyncSession], app.state.session_factory)
         async with factory() as session:
             assert await session.scalar(select(func.count()).select_from(Task)) == 1

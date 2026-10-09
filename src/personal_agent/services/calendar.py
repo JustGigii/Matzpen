@@ -1,17 +1,32 @@
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta
+from typing import Literal
 from zoneinfo import ZoneInfo
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from personal_agent.core.time import require_aware
-from personal_agent.domain.enums import ActionClass, ApprovalStatus
-from personal_agent.domain.models import ApprovalRequest, AuditLog
+from personal_agent.domain.enums import (
+    ActionClass,
+    ApprovalStatus,
+    CalendarActionStatus,
+    CommitmentStatus,
+    TaskStatus,
+)
+from personal_agent.domain.models import (
+    ApprovalRequest,
+    AuditLog,
+    CalendarAction,
+    Commitment,
+    Task,
+)
 from personal_agent.integrations.google_calendar.base import CalendarEvent, CalendarProvider
 from personal_agent.integrations.telegram.base import TelegramNotifier
 
 CALENDAR_CREATE_ACTION = "create_calendar_event"
+CalendarItemResult = Literal["created", "already_exists", "missing", "closed", "untimed"]
 
 
 class CalendarService:
@@ -133,3 +148,112 @@ class CalendarService:
             )
             await session.commit()
             return True
+
+    async def add_item_to_calendar(self, item_id: uuid.UUID) -> CalendarItemResult:
+        """Create a short Calendar block after an explicit Telegram button press.
+
+        The button itself is the user's approval. A stable action key and event ID make repeated
+        taps idempotent, while the linked CalendarAction keeps the task/commitment status visible.
+        """
+
+        executed_at = require_aware(self._now())
+        async with self._session_factory() as session:
+            commitment = await session.get(Commitment, item_id)
+            task = await session.get(Task, item_id) if commitment is None else None
+            if commitment is None and task is None:
+                return "missing"
+            source_event_id: uuid.UUID | None
+            if commitment is not None:
+                if commitment.status in {CommitmentStatus.DONE, CommitmentStatus.CANCELLED}:
+                    return "closed"
+                summary = commitment.summary
+                due_at = commitment.due_at
+                source_event_id = commitment.source_event_id
+                item_kind = "commitment"
+            else:
+                assert task is not None
+                if task.status in {TaskStatus.DONE, TaskStatus.CANCELLED}:
+                    return "closed"
+                summary = task.title
+                due_at = task.due_at
+                source_event_id = task.source_event_id
+                item_kind = "task"
+            if due_at is None:
+                return "untimed"
+            if source_event_id is None:
+                return "missing"
+
+            dedupe_key = f"manual-calendar:{item_kind}:{item_id}"
+            action = await session.scalar(
+                select(CalendarAction).where(CalendarAction.dedupe_key == dedupe_key)
+            )
+            if action is not None and action.status is CalendarActionStatus.EXECUTED:
+                return "already_exists"
+            payload = {
+                "summary": summary,
+                "description": (
+                    "נוסף מהסוכן האישי בלחיצה מפורשת. הפריט נשאר פתוח עד לסימון 'סיימתי'."
+                ),
+                "start": due_at.isoformat(),
+                "end": (due_at + timedelta(minutes=30)).isoformat(),
+                "recurrence": [],
+                "attendees": [],
+                "item_kind": item_kind,
+                "item_id": str(item_id),
+            }
+            if action is None:
+                action = CalendarAction(
+                    source_event_id=source_event_id,
+                    commitment_id=commitment.id if commitment is not None else None,
+                    operation="create",
+                    payload_json=payload,
+                    status=CalendarActionStatus.PENDING,
+                    dedupe_key=dedupe_key,
+                )
+                session.add(action)
+                await session.flush()
+            else:
+                action.payload_json = payload
+                action.status = CalendarActionStatus.PENDING
+
+            try:
+                created = await self._provider.create_event(
+                    CalendarEvent(
+                        external_id=f"pa{action.id.hex}",
+                        summary=summary,
+                        description=str(payload["description"]),
+                        start=due_at,
+                        end=due_at + timedelta(minutes=30),
+                    )
+                )
+            except Exception as exc:
+                action.status = CalendarActionStatus.FAILED
+                session.add(
+                    AuditLog(
+                        actor="calendar_service",
+                        action="add_item_to_calendar",
+                        target=str(item_id),
+                        policy_decision="explicit_telegram_button",
+                        result="failed",
+                        redacted_metadata={"error_type": type(exc).__name__},
+                    )
+                )
+                await session.commit()
+                raise
+
+            action.google_event_id = created.external_id
+            action.status = CalendarActionStatus.EXECUTED
+            action.executed_at = executed_at
+            if commitment is not None:
+                commitment.calendar_action_id = action.id
+            session.add(
+                AuditLog(
+                    actor="calendar_service",
+                    action="add_item_to_calendar",
+                    target=str(item_id),
+                    policy_decision="explicit_telegram_button",
+                    result="executed",
+                )
+            )
+            await session.commit()
+            return "created"

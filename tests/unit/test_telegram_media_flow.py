@@ -5,6 +5,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 from personal_agent.domain.schemas import IntakeResult
+from personal_agent.integrations.llm.base import (
+    LLMQuotaExceededError,
+    LLMServiceUnavailableError,
+)
 from personal_agent.integrations.telegram.runtime import TelegramRuntime
 
 
@@ -85,6 +89,7 @@ async def test_media_without_an_action_gets_one_helpful_reply() -> None:
     runtime._intake_service = SimpleNamespace(
         ingest=AsyncMock(return_value=IntakeResult(event_id="event-2", created=True))
     )
+    runtime._conversation_service = None
     runtime._handle_spoken_request = AsyncMock(return_value=False)
 
     message = SimpleNamespace(
@@ -149,3 +154,69 @@ async def test_text_enters_intake_without_a_technical_summary() -> None:
 
     message.reply_text.assert_not_awaited()
     runtime._intake_service.ingest.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_text_reports_gemini_quota_in_telegram() -> None:
+    runtime = object.__new__(TelegramRuntime)
+    runtime._allowed_user_ids = frozenset({123})
+    runtime._control = SimpleNamespace(paused=False)
+    runtime._application = SimpleNamespace(bot=SimpleNamespace(id=777))
+    runtime._intake_service = SimpleNamespace(
+        ingest=AsyncMock(
+            side_effect=LLMQuotaExceededError(40, daily_limit=True),
+        )
+    )
+    runtime._handle_spoken_request = AsyncMock(return_value=False)
+
+    message = SimpleNamespace(
+        message_id=58,
+        date=datetime(2026, 8, 1, 12, 3, tzinfo=UTC),
+        text="שלום",
+        reply_text=AsyncMock(),
+    )
+    update = SimpleNamespace(
+        message=message,
+        effective_user=SimpleNamespace(id=123, full_name="Test User"),
+        effective_chat=SimpleNamespace(id=123),
+    )
+
+    await runtime._ingest_text(update, SimpleNamespace())
+
+    message.reply_text.assert_awaited_once()
+    reply = message.reply_text.await_args.args[0]
+    assert "מכסת שירות ה-AI נוצלה" in reply
+    assert "40 שניות" in reply
+    assert "מכסת החינם היומית" in reply
+
+
+@pytest.mark.asyncio
+async def test_text_reports_temporary_gemini_unavailability_without_raw_error() -> None:
+    runtime = object.__new__(TelegramRuntime)
+    runtime._allowed_user_ids = frozenset({123})
+    runtime._control = SimpleNamespace(paused=False)
+    runtime._application = SimpleNamespace(bot=SimpleNamespace(id=777))
+    runtime._intake_service = SimpleNamespace(
+        ingest=AsyncMock(side_effect=LLMServiceUnavailableError(30))
+    )
+    runtime._handle_manual_time_reply = AsyncMock(return_value=False)
+    runtime._handle_spoken_request = AsyncMock(return_value=False)
+
+    message = SimpleNamespace(
+        message_id=59,
+        date=datetime(2026, 8, 1, 12, 3, tzinfo=UTC),
+        text="שלום",
+        reply_text=AsyncMock(),
+    )
+    update = SimpleNamespace(
+        message=message,
+        effective_user=SimpleNamespace(id=123, full_name="Test User"),
+        effective_chat=SimpleNamespace(id=123),
+    )
+
+    await runtime._ingest_text(update, SimpleNamespace())
+
+    reply = message.reply_text.await_args.args[0]
+    assert "שירות ה-AI עמוס זמנית" in reply
+    assert "30 שניות" in reply
+    assert "ServerError" not in reply

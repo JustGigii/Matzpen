@@ -60,9 +60,9 @@ class TelegramTextNotifier:
         keyboard = InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("✅ בצע עכשיו", callback_data=f"execute:{approval_id}"),
+                    InlineKeyboardButton("✅ שמור משימה", callback_data=f"execute:{approval_id}"),
                     InlineKeyboardButton("✏️ שנה", callback_data=f"change:{approval_id}"),
-                    InlineKeyboardButton("🗑️ בטל", callback_data=f"cancel:{approval_id}"),
+                    InlineKeyboardButton("🗑️ אל תשמור", callback_data=f"cancel:{approval_id}"),
                 ]
             ]
         )
@@ -83,12 +83,12 @@ class TelegramTextNotifier:
         keyboard = InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("✅ בוצע", callback_data=f"done:{commitment_id}"),
-                    InlineKeyboardButton("🧠 דחייה חכמה", callback_data=f"smart:{reminder_id}"),
+                    InlineKeyboardButton("✅ סיימתי", callback_data=f"done:{commitment_id}"),
+                    InlineKeyboardButton("⏰ לא עכשיו", callback_data=f"smart:{reminder_id}"),
                 ],
                 [
-                    InlineKeyboardButton("🕓 בחר שעה", callback_data=f"choose:{commitment_id}"),
-                    InlineKeyboardButton("🗑️ בטל", callback_data=f"drop:{commitment_id}"),
+                    InlineKeyboardButton("🕓 שעה אחרת", callback_data=f"choose:{commitment_id}"),
+                    InlineKeyboardButton("🗑️ לא רלוונטי", callback_data=f"drop:{commitment_id}"),
                 ],
             ]
         )
@@ -103,8 +103,8 @@ class TelegramTextNotifier:
         keyboard = InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("✅ אשר", callback_data=f"approve:{approval_id}"),
-                    InlineKeyboardButton("✖️ דחה", callback_data=f"reject:{approval_id}"),
+                    InlineKeyboardButton("✅ שמור", callback_data=f"approve:{approval_id}"),
+                    InlineKeyboardButton("🗑️ אל תשמור", callback_data=f"reject:{approval_id}"),
                 ]
             ]
         )
@@ -138,6 +138,35 @@ class TelegramTextNotifier:
         )
         return str(message.message_id)
 
+    async def detail_clarification_request(
+        self,
+        approval_id: str,
+        summary: str,
+        question: str,
+        options: tuple[str, ...],
+    ) -> str:
+        option_rows = [
+            [InlineKeyboardButton(option, callback_data=f"detail:{approval_id}:{index}")]
+            for index, option in enumerate(options)
+        ]
+        keyboard = InlineKeyboardMarkup(
+            [
+                *option_rows,
+                [
+                    InlineKeyboardButton(
+                        "✏️ אכתוב במילים שלי", callback_data=f"detailother:{approval_id}"
+                    ),
+                    InlineKeyboardButton("🗑️ בטל", callback_data=f"cancel:{approval_id}"),
+                ],
+            ]
+        )
+        message = await self._bot.send_message(
+            chat_id=self._user_id,
+            text=f"🤔 צריך עוד פרט\n━━━━━━━━━━━━\n{summary}\n\n❓ {question}",
+            reply_markup=keyboard,
+        )
+        return str(message.message_id)
+
     async def workflow_confirmation(self, message_id: str | None, text: str) -> str:
         if message_id is not None:
             await self._bot.edit_message_text(
@@ -165,6 +194,45 @@ class TelegramTextNotifier:
         message = await self._bot.send_message(
             chat_id=self._user_id,
             text=timetable_card(summary),
+            reply_markup=keyboard,
+        )
+        return str(message.message_id)
+
+    async def group_tracking_request(self, conversation_id: str, display_name: str) -> str:
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ עקוב אחרי הקבוצה", callback_data=f"watch:{conversation_id}"
+                    ),
+                    InlineKeyboardButton("🔕 אל תעקוב", callback_data=f"unwatch:{conversation_id}"),
+                ]
+            ]
+        )
+        message = await self._bot.send_message(
+            chat_id=self._user_id,
+            text=(
+                "👥 זוהתה קבוצת WhatsApp חדשה\n"
+                "━━━━━━━━━━━━\n"
+                f"📛 {display_name}\n\n"
+                "לעקוב אחרי תכנון פגישות ועדכונים על התחייבויות בקבוצה?"
+            ),
+            reply_markup=keyboard,
+        )
+        return str(message.message_id)
+
+    async def memory_request(self, approval_id: str, summary: str) -> str:
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("🧠 שמור", callback_data=f"remember:{approval_id}"),
+                    InlineKeyboardButton("✖️ אל תשמור", callback_data=f"forget:{approval_id}"),
+                ]
+            ]
+        )
+        message = await self._bot.send_message(
+            chat_id=self._user_id,
+            text=f"🧠 זיכרון מוצע\n━━━━━━━━━━━━\n{summary}",
             reply_markup=keyboard,
         )
         return str(message.message_id)

@@ -48,8 +48,13 @@ Untimed commitments have no exact-time reminders and remain in every daily brief
 cancelled. Timed commitments become overdue once after `OVERDUE_GRACE_MINUTES`; they are not flooded
 with repeated immediate alerts.
 
-Reminder buttons support Done, Smart snooze, Choose time, Cancel, 10 minutes, and 1 hour. Exact
-times can be supplied with:
+Reminder buttons clearly separate **Finished** (the item was completed) from **Not relevant** (drop
+it without claiming completion), plus remind-later, choose-time, 10-minute, and 1-hour actions. A
+failed Telegram delivery returns to the durable queue and is retried on the next scheduler pass.
+If a due-time alert gets no action, one follow-up is queued after the overdue grace period (15
+minutes by default). The time picker includes a `Write time` Force Reply that accepts values such as
+`19:30`, `tomorrow 08:15`
+(in Hebrew), or `04.08 17:45`. Exact ISO times can also be supplied with:
 
 ```text
 /reschedule <commitment-id> <ISO-time>
@@ -82,14 +87,26 @@ action card, without intermediate extraction, transcript, or technical count mes
 question such as `מה יש היום?` is routed to the spoken-query handler instead of creating a
 commitment.
 
+When the intake pipeline finds no action to create, the message continues to Gemini as a normal
+Telegram conversation. Gemini receives a bounded application context: up to 12 recent Telegram
+turns, confirmed memory facts, active commitments/tasks, and the next seven days of Google Calendar
+events. It does not receive database access, credentials, arbitrary API access, or a tool that can
+perform actions. Any stable personal fact Gemini suggests is stored only as a proposal and appears
+with **שמור** and **אל תשמור** buttons; only an explicit approval makes it confirmed memory.
+`/memory` displays confirmed memories only. See
+[`docs/telegram-gemini-memory.md`](docs/telegram-gemini-memory.md) for the exact context boundaries.
+
 Commands:
 
 ```text
 /start /status /today /calendar /tasks /commitments /memory
-/pause /resume /reschedule /resolve_time /help
+/pause /resume /reschedule /resolve_time /groups /help
 ```
 
 `/today` returns a fresh daily summary without causing an automatic-delivery duplicate.
+`/tasks` and the Hebrew request `מה המשימות שלי` render only open tasks as actionable cards.
+Each card can mark the task done, choose a new due time, or cancel it; resolved tasks disappear
+from the next task view and their remaining reminders are closed.
 
 The development CLI remains available:
 
@@ -121,16 +138,63 @@ datetimes must include a UTC offset.
 Media extraction uses Gemini inline data only after Telegram and application size checks. Automated
 tests use queued fake transcripts and never upload test files or require external credentials.
 
+### LLM fallback providers
+
+The runtime uses the first configured provider that succeeds, in this order: Gemini, Groq,
+Cerebras, then Mistral OCR for supported documents and images. Quota and temporary service errors
+move to the next provider and place the failed provider on a short in-memory cooldown. Invalid
+credentials and invalid requests remain visible configuration errors instead of being hidden.
+
+```env
+GROQ_API_KEY=<key>
+CEREBRAS_API_KEY=<key>
+MISTRAL_API_KEY=<key>
+```
+
+Groq supplies structured text, image/OCR, and audio transcription fallbacks. Cerebras supplies a
+second structured-text fallback. Mistral OCR handles PDF and image extraction. All are optional;
+model defaults are listed in `.env.example`.
+
+## Oracle Autonomous Database
+
+Oracle uses the async `python-oracledb` Thin driver, so no Oracle Instant Client is required. Keep
+credentials out of `DATABASE_URL`:
+
+```env
+DATABASE_URL=oracle+oracledb_async://@
+ORACLE_USER=ADMIN
+ORACLE_PASSWORD=<database-password>
+ORACLE_DSN=<full TLS DSN from Oracle Cloud>
+```
+
+After setting those values, verify the connection, create the schema, and copy the current SQLite
+data:
+
+```powershell
+.\.venv\python.exe scripts\check_oracle.py
+.\.venv\python.exe -m alembic upgrade head
+.\.venv\python.exe scripts\migrate_sqlite_to_oracle.py
+.\.venv\python.exe scripts\verify_database_copy.py
+```
+
+The copy command only accepts an empty Oracle target, runs inserts in a transaction, and verifies
+row counts. The final verification compares a canonical fingerprint of every field in every row.
+Keep a backup of `data/personal_agent.db` until the application has been verified against Oracle.
+
 ## Google Calendar
 
 Google Calendar is canonical for meetings, appointments, classes/course rows, interviews, and
-submission deadlines. High-confidence user-only items use preview plus the same grace period;
-low-confidence items require approval. Timetable rows become idempotent recurring actions and rows
-marked excluded are skipped. Assignment deadlines create deadline events and earlier reminders,
-not invented work blocks.
+submission deadlines. Every Calendar write requires explicit approval; it never uses the automatic
+grace-period path. Timetable rows become idempotent recurring actions and rows marked excluded are
+skipped. Assignment deadlines create deadline events and earlier reminders, not invented work
+blocks.
 
 The current local environment is connected and has been verified with successful Google Calendar
 writes. The OAuth steps below are still required when setting up a new environment.
+
+Any timed task or commitment can also be added with the **Add to Calendar** button in its Telegram
+card. That explicit tap creates one idempotent 30-minute Calendar block; repeated taps do not create
+duplicates.
 
 OAuth setup:
 
@@ -168,11 +232,23 @@ minutes bypass the buffer once. Incoming requests remain proposals and are never
 automatically. Groups require user authorship or a direct mention/request; archived and denylisted
 chats are excluded.
 
+Private conversation follow-ups remain in the same durable buffer once the conversation becomes
+relevant. This lets a sequence such as agreeing to a Zoom call, specifying “at 7”, and clarifying
+“in the evening” produce separate meeting and link-sending items at 19:00. Timed meetings include a
+Calendar proposal, while both the meeting and reminders remain pending until the user approves the
+cards in Telegram.
+
 The first seven days are a bounded, review-only scan with a durable watermark. Edits/revocations
 invalidate pending work; changes to an already executed interpretation are surfaced without silent
 mutation. Voice/audio, images, PDF, DOCX, TXT/Markdown/CSV use the transient media pipeline up to
 18 MiB; video and unknown/oversized files are rejected. Raw WhatsApp content is redacted after 30
 days while provenance and derived records remain.
+Incoming group voice notes from other participants are downloaded and transcribed only after the
+group is explicitly tracked, or when the message is directed to the user. The user's own group
+voice notes remain eligible without group tracking. Raw audio bytes are never stored.
+Prompts for newly discovered groups are disabled by default to avoid Telegram noise. Set
+`WHATSAPP_PROMPT_NEW_GROUPS=true` if every new group should ask for a tracking decision; `/groups`
+remains available for choosing groups manually.
 
 The production adapter is intentionally GET-only and exposes no send/reply/react/edit/delete
 method. OpenWA and its bundled dashboard stay on VM loopback; only the signed personal-agent
@@ -219,7 +295,7 @@ Keep the API on localhost/private networking or behind a secured HTTPS reverse p
 
 ## Database migration
 
-Apply migrations through `20260801_0005_whatsapp_read_model` with `alembic upgrade head`. They add
+Apply migrations through `20260802_0006_whatsapp_group_tracking` with `alembic upgrade head`. They add
 durable reminder, calendar action, morning brief, WhatsApp session/conversation/buffer/history, and
 people tables plus lifecycle/idempotency, redaction, and reminder-card fields. See
 [`docs/migrations.md`](docs/migrations.md) for details.

@@ -22,6 +22,18 @@ class Settings(BaseSettings):
 
     gemini_api_key: SecretStr | None = None
     gemini_model: str | None = None
+    groq_api_key: SecretStr | None = None
+    groq_text_model: str = "openai/gpt-oss-120b"
+    groq_vision_model: str = "qwen/qwen3.6-27b"
+    groq_audio_model: str = "whisper-large-v3"
+    cerebras_api_key: SecretStr | None = None
+    cerebras_model: str = "gpt-oss-120b"
+    mistral_api_key: SecretStr | None = None
+    mistral_ocr_model: str = "mistral-ocr-latest"
+
+    oracle_user: str | None = None
+    oracle_password: SecretStr | None = None
+    oracle_dsn: str | None = None
 
     telegram_bot_token: SecretStr | None = None
     telegram_allowed_user_ids: tuple[int, ...] = ()
@@ -45,6 +57,7 @@ class Settings(BaseSettings):
     whatsapp_max_media_bytes: int = Field(default=18_874_368, ge=1, le=20_000_000)
     whatsapp_event_retention_days: int = Field(default=30, ge=1, le=365)
     whatsapp_disconnect_warning_minutes: int = Field(default=10, ge=1, le=1440)
+    whatsapp_prompt_new_groups: bool = False
 
     shortcut_bearer_token: SecretStr | None = None
 
@@ -53,7 +66,7 @@ class Settings(BaseSettings):
     google_calendar_id: str = "primary"
 
     internal_action_grace_seconds: int = Field(default=60, ge=0)
-    default_reminder_lead_minutes: int = Field(default=5, ge=0)
+    default_reminder_lead_minutes: int = Field(default=15, ge=0)
     proactive_check_interval_seconds: int = Field(default=60, ge=1)
     clarification_fallback_minutes: int = Field(default=10, ge=1)
     approval_expiry_hours: int = Field(default=24, ge=1)
@@ -76,6 +89,12 @@ class Settings(BaseSettings):
     @field_validator(
         "gemini_api_key",
         "gemini_model",
+        "groq_api_key",
+        "cerebras_api_key",
+        "mistral_api_key",
+        "oracle_user",
+        "oracle_password",
+        "oracle_dsn",
         "telegram_bot_token",
         "openwa_api_key",
         "openwa_session_id",
@@ -149,6 +168,10 @@ class Settings(BaseSettings):
             )
         if (self.gemini_api_key is None) != (self.gemini_model is None):
             raise ValueError("GEMINI_API_KEY and GEMINI_MODEL must be configured together")
+        if self.database_url.startswith("oracle+") and not self.oracle_configured:
+            raise ValueError(
+                "ORACLE_USER, ORACLE_PASSWORD and ORACLE_DSN are required for an Oracle database"
+            )
         if (self.google_client_secret_file is None) != (self.google_token_file is None):
             raise ValueError(
                 "GOOGLE_CLIENT_SECRET_FILE and GOOGLE_TOKEN_FILE must be configured together"
@@ -162,6 +185,40 @@ class Settings(BaseSettings):
     @property
     def gemini_configured(self) -> bool:
         return self.gemini_api_key is not None and self.gemini_model is not None
+
+    @property
+    def groq_configured(self) -> bool:
+        return self.groq_api_key is not None
+
+    @property
+    def cerebras_configured(self) -> bool:
+        return self.cerebras_api_key is not None
+
+    @property
+    def mistral_configured(self) -> bool:
+        return self.mistral_api_key is not None
+
+    @property
+    def oracle_configured(self) -> bool:
+        return (
+            self.oracle_user is not None
+            and self.oracle_password is not None
+            and self.oracle_dsn is not None
+        )
+
+    def database_connect_args(self) -> dict[str, str]:
+        if not self.database_url.startswith("oracle+"):
+            return {}
+        if not self.oracle_configured:
+            raise ValueError("Oracle database credentials are incomplete")
+        assert self.oracle_user is not None
+        assert self.oracle_password is not None
+        assert self.oracle_dsn is not None
+        return {
+            "user": self.oracle_user,
+            "password": self.oracle_password.get_secret_value(),
+            "dsn": self.oracle_dsn,
+        }
 
     @property
     def google_calendar_configured(self) -> bool:

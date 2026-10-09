@@ -10,6 +10,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
+from personal_agent.domain.database import JSONData
+
 revision: str = "20260731_0001"
 down_revision: str | None = None
 branch_labels: str | Sequence[str] | None = None
@@ -48,7 +50,7 @@ def upgrade() -> None:
         sa.Column("actor_display_name", sa.String(length=255), nullable=True),
         sa.Column("conversation_external_id", sa.String(length=255), nullable=True),
         sa.Column("content_text", sa.Text(), nullable=True),
-        sa.Column("payload_json", sa.JSON(), nullable=False),
+        sa.Column("payload_json", JSONData(), nullable=False),
         sa.Column("dedupe_key", sa.String(length=255), nullable=False),
         sa.Column(
             "sensitivity",
@@ -146,7 +148,7 @@ def upgrade() -> None:
         sa.Column("category", sa.String(length=100), nullable=False),
         sa.Column("subject", sa.String(length=500), nullable=False),
         sa.Column("predicate", sa.String(length=500), nullable=False),
-        sa.Column("value_json", sa.JSON(), nullable=False),
+        sa.Column("value_json", JSONData(), nullable=False),
         sa.Column(
             "status",
             sa.Enum(
@@ -171,7 +173,7 @@ def upgrade() -> None:
             ),
             nullable=False,
         ),
-        sa.Column("source_event_ids", sa.JSON(), nullable=False),
+        sa.Column("source_event_ids", JSONData(), nullable=False),
         sa.Column("valid_from", sa.DateTime(timezone=True), nullable=True),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("last_verified_at", sa.DateTime(timezone=True), nullable=False),
@@ -182,7 +184,7 @@ def upgrade() -> None:
         "approval_requests",
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("action_type", sa.String(length=100), nullable=False),
-        sa.Column("action_payload", sa.JSON(), nullable=False),
+        sa.Column("action_payload", JSONData(), nullable=False),
         sa.Column("risk_class", sa.String(length=50), nullable=False),
         sa.Column(
             "status",
@@ -215,7 +217,7 @@ def upgrade() -> None:
         sa.Column("source_event_id", sa.Uuid(), nullable=True),
         sa.Column("approval_id", sa.Uuid(), nullable=True),
         sa.Column("result", sa.String(length=100), nullable=False),
-        sa.Column("redacted_metadata", sa.JSON(), nullable=False),
+        sa.Column("redacted_metadata", JSONData(), nullable=False),
         sa.Column("timestamp", sa.DateTime(timezone=True), nullable=False),
         sa.ForeignKeyConstraint(["approval_id"], ["approval_requests.id"]),
         sa.ForeignKeyConstraint(["source_event_id"], ["events.id"]),

@@ -30,6 +30,7 @@ from personal_agent.integrations.telegram.base import TelegramNotifier
 
 COMMITMENT_WORKFLOW_ACTION = "execute_commitment_workflow"
 CLARIFICATION_ACTION = "clarify_extraction"
+DETAIL_CLARIFICATION_ACTION = "clarify_details"
 EXTRACTION_CONFIRMATION_ACTION = "confirm_extraction"
 MAX_REMINDER_LEAD_MINUTES = 7 * 24 * 60
 

@@ -1,5 +1,6 @@
 import base64
 import binascii
+import re
 from collections.abc import Sequence
 from datetime import datetime
 from typing import Protocol
@@ -43,7 +44,7 @@ class OpenWAReadClient(Protocol):
     ) -> Sequence[OpenWAHistoryMessage]: ...
 
     async def download_media(
-        self, session_id: str, message_id: str
+        self, session_id: str, chat_id: str, message_id: str
     ) -> OpenWAMediaContent | None: ...
 
     async def aclose(self) -> None: ...
@@ -158,39 +159,68 @@ class HttpOpenWAReadClient:
         max_messages_per_chat: int,
     ) -> Sequence[OpenWAHistoryMessage]:
         safe_session = quote(session_id, safe="")
-        response = await self._get(
-            f"sessions/{safe_session}/messages",
-            params={
-                "from": since.isoformat(),
-                "limit": max_messages,
-                "offset": 0,
-            },
-        )
         per_chat: dict[str, int] = {}
         result: list[OpenWAHistoryMessage] = []
-        for row in self._rows(response.json(), "messages"):
-            data = OpenWAEventData.model_validate(row)
-            chat_id = data.chat_id or "unknown"
-            if data.timestamp is not None and data.timestamp < since:
-                continue
-            if per_chat.get(chat_id, 0) >= max_messages_per_chat:
-                continue
-            per_chat[chat_id] = per_chat.get(chat_id, 0) + 1
-            result.append(OpenWAHistoryMessage(session_id=session_id, data=data))
-            if len(result) >= max_messages:
+        offset = 0
+        page_size = min(max_messages, 100)
+        while len(result) < max_messages:
+            response = await self._get(
+                f"sessions/{safe_session}/messages",
+                params={"limit": page_size, "offset": offset},
+            )
+            rows = self._rows(response.json(), "messages")
+            if not rows:
                 break
+            for row in rows:
+                data = OpenWAEventData.model_validate(row)
+                chat_id = data.chat_id or "unknown"
+                if data.timestamp is not None and data.timestamp < since:
+                    continue
+                if per_chat.get(chat_id, 0) >= max_messages_per_chat:
+                    continue
+                per_chat[chat_id] = per_chat.get(chat_id, 0) + 1
+                result.append(OpenWAHistoryMessage(session_id=session_id, data=data))
+                if len(result) >= max_messages:
+                    break
+            if len(rows) < page_size:
+                break
+            offset += len(rows)
         return result
 
-    async def download_media(self, session_id: str, message_id: str) -> OpenWAMediaContent | None:
+    async def download_media(
+        self, session_id: str, chat_id: str, message_id: str
+    ) -> OpenWAMediaContent | None:
         safe_session = quote(session_id, safe="")
+        safe_chat = quote(chat_id, safe="")
+        safe_message = quote(message_id, safe="")
+        try:
+            response = await self._get(
+                f"sessions/{safe_session}/messages/{safe_chat}/{safe_message}/media"
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in {404, 405}:
+                raise
+        else:
+            content_type = response.headers.get("Content-Type", "application/octet-stream")
+            mime_type = content_type.partition(";")[0].strip() or "application/octet-stream"
+            disposition = response.headers.get("Content-Disposition", "")
+            match = re.search(r'filename\*?=(?:UTF-8\'\')?["\']?([^"\';]+)', disposition)
+            filename = match.group(1).strip() if match else None
+            return OpenWAMediaContent(response.content, mime_type, filename)
+
+        # Compatibility fallback for older OpenWA builds that expose inline base64 media.
         response = await self._get(
             f"sessions/{safe_session}/messages", params={"limit": 1000, "offset": 0}
         )
         for row in self._rows(response.json(), "messages"):
-            identifier = row.get("id") or row.get("messageId")
+            identifier = row.get("waMessageId") or row.get("messageId") or row.get("id")
             if str(identifier) != message_id:
                 continue
-            media = row.get("media") if isinstance(row.get("media"), dict) else {}
+            media_value = row.get("media")
+            metadata = row.get("metadata")
+            if not isinstance(media_value, dict) and isinstance(metadata, dict):
+                media_value = metadata.get("media")
+            media = media_value if isinstance(media_value, dict) else {}
             assert isinstance(media, dict)
             encoded = (
                 media.get("data")
@@ -207,9 +237,12 @@ class HttpOpenWAReadClient:
             except (binascii.Error, ValueError):
                 return None
             mime_type = str(
-                media.get("mimeType") or row.get("mimeType") or "application/octet-stream"
+                media.get("mimeType")
+                or media.get("mimetype")
+                or row.get("mimeType")
+                or "application/octet-stream"
             )
-            filename_value = media.get("fileName") or row.get("fileName")
+            filename_value = media.get("fileName") or media.get("filename") or row.get("fileName")
             filename = str(filename_value) if filename_value else None
             return OpenWAMediaContent(content, mime_type, filename)
         return None

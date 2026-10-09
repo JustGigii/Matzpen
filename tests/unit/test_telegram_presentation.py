@@ -1,6 +1,8 @@
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from personal_agent.domain.enums import CalendarActionStatus, CommitmentStatus, EventSource
+from personal_agent.domain.models import CalendarAction, Commitment, Event
 from personal_agent.integrations.telegram.presentation import (
     approval_card,
     clarification_card,
@@ -10,6 +12,7 @@ from personal_agent.integrations.telegram.presentation import (
     reminder_card,
     timetable_card,
 )
+from personal_agent.integrations.telegram.runtime import TelegramRuntime
 
 
 def test_action_cards_are_scannable_and_use_local_time() -> None:
@@ -20,10 +23,12 @@ def test_action_cards_are_scannable_and_use_local_time() -> None:
     reminder = reminder_card("פגישה עם יובל", scheduled_for, timezone)
 
     assert "🧠 זיהיתי התחייבות" in pending
-    assert "01.08 בשעה 17:15" in pending
+    assert "בעוד כדקה" in pending
     assert "📝 פגישה עם יובל" in pending
-    assert "⏰ תזכורת" in reminder
+    assert "🔔 צריך החלטה" in reminder
     assert "📅 מועד: 01.08 בשעה 17:15" in reminder
+    assert "סיימתי = בוצע" in reminder
+    assert "לא רלוונטי = מסיר" in reminder
 
 
 def test_decision_cards_explain_the_next_action() -> None:
@@ -49,3 +54,25 @@ def test_friendly_time_avoids_iso_formatting() -> None:
     assert (
         friendly_local_datetime(reference + timedelta(days=1), reference, timezone) == "מחר ב־13:00"
     )
+
+
+def test_commitment_detail_includes_due_source_status_and_calendar() -> None:
+    runtime = object.__new__(TelegramRuntime)
+    runtime._timezone = ZoneInfo("Asia/Jerusalem")
+    commitment = Commitment(
+        summary="שיחת Zoom עם Shaked Aviv",
+        due_at=datetime(2026, 8, 4, 16, 0, tzinfo=UTC),
+        status=CommitmentStatus.SCHEDULED,
+    )
+    source = Event(
+        source=EventSource.WHATSAPP,
+        payload_json={"conversation_display_name": "Shaked Aviv"},
+    )
+    calendar_action = CalendarAction(status=CalendarActionStatus.EXECUTED)
+
+    detail = runtime._commitment_detail(commitment, source, calendar_action)
+
+    assert "04.08.2026 בשעה 19:00" in detail
+    assert "סטטוס: מתוזמנת" in detail  # noqa: RUF001
+    assert "WhatsApp עם Shaked Aviv" in detail
+    assert "נוסף ל־Google Calendar" in detail

@@ -233,6 +233,7 @@ class ReminderService:
                     )
                 ).all()
             )
+            delivered = 0
             for reminder in reminders:
                 commitment = (
                     await session.get(Commitment, reminder.commitment_id)
@@ -276,13 +277,58 @@ class ReminderService:
                     )
                 )
                 await session.commit()
-                message_id = await self._notifier.reminder(
-                    str(target_id),
-                    summary,
-                    due_at or reminder.scheduled_for,
-                    str(reminder.id),
-                )
+                try:
+                    message_id = await self._notifier.reminder(
+                        str(target_id),
+                        summary,
+                        due_at or reminder.scheduled_for,
+                        str(reminder.id),
+                    )
+                except Exception as exc:
+                    # A transient Telegram failure must not permanently consume the reminder.
+                    # Return it to the durable queue so the next scheduler pass retries it.
+                    reminder.status = ReminderStatus.PENDING
+                    reminder.sent_at = None
+                    session.add(
+                        AuditLog(
+                            actor="reminder_service",
+                            action="send_reminder_to_user",
+                            target=str(target_id),
+                            result="delivery_failed_retry_pending",
+                            redacted_metadata={
+                                "reminder_id": str(reminder.id),
+                                "error_type": type(exc).__name__,
+                            },
+                        )
+                    )
+                    await session.commit()
+                    logger.warning(
+                        "reminder_delivery_failed_retry_pending",
+                        extra={
+                            "reminder_id": str(reminder.id),
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+                    continue
                 reminder.telegram_message_id = message_id
+                delivered += 1
+                if reminder.kind is ReminderKind.DUE and self._overdue_grace_minutes > 0:
+                    follow_up_key = f"{reminder.dedupe_key}:unanswered-follow-up"
+                    follow_up = await session.scalar(
+                        select(Reminder).where(Reminder.dedupe_key == follow_up_key)
+                    )
+                    if follow_up is None:
+                        session.add(
+                            Reminder(
+                                commitment_id=reminder.commitment_id,
+                                task_id=reminder.task_id,
+                                kind=ReminderKind.SNOOZE,
+                                scheduled_for=effective_at
+                                + timedelta(minutes=self._overdue_grace_minutes),
+                                status=ReminderStatus.PENDING,
+                                dedupe_key=follow_up_key,
+                            )
+                        )
                 session.add(
                     AuditLog(
                         actor="reminder_service",
@@ -293,7 +339,7 @@ class ReminderService:
                     )
                 )
             await session.commit()
-            return len(reminders)
+            return delivered
 
     async def mark_overdue(self, at: datetime | None = None) -> int:
         effective_at = require_aware(at or self._now())

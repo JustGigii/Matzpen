@@ -53,3 +53,38 @@ Adds the durable read model for the read-only OpenWA integration:
 Back up both `data/personal_agent.db` and OpenWA's encrypted session/data backup before upgrading.
 The downgrade removes these tables/columns and therefore discards WhatsApp review and retention
 state, but does not alter OpenWA's separate SQLite/session files.
+
+## `20260802_0006_whatsapp_group_tracking`
+
+Adds durable opt-in state to `whatsapp_conversations`:
+
+- `tracking_enabled` records the user's explicit Telegram choice for each group; and
+- `tracking_prompted_at` prevents repeated prompts for the same discovered group.
+
+Disabling tracking also cancels any still-pending conversation buffer for that group. The
+downgrade removes only these two fields and does not delete WhatsApp messages or OpenWA state.
+
+## SQLite to Oracle Autonomous Database
+
+The ORM and historical migrations use portable JSON storage: SQLite stores JSON text and Oracle
+stores it in CLOB columns. Application timestamps are normalized to UTC before Oracle stores them.
+
+1. Back up `data/personal_agent.db`.
+2. Configure `DATABASE_URL=oracle+oracledb_async://@` plus `ORACLE_USER`, `ORACLE_PASSWORD`, and
+   `ORACLE_DSN` in `.env`.
+3. Run `.\.venv\python.exe scripts\check_oracle.py`.
+4. Run `.\.venv\python.exe -m alembic upgrade head` against the empty Oracle schema.
+5. Run `.\.venv\python.exe scripts\migrate_sqlite_to_oracle.py`.
+6. Run `.\.venv\python.exe scripts\verify_database_copy.py`.
+
+The transfer refuses to run if any application table in Oracle already contains data. It defers
+the self-reference on superseded events until all event rows exist, then compares every source and
+target table count before reporting success.
+
+## `20260804_0007_oracle_timestamp_precision`
+
+Oracle maps generic SQLAlchemy `DateTime` to `DATE`, which does not preserve fractional seconds.
+This Oracle-only migration changes every application UTC timestamp column to `TIMESTAMP`; SQLite
+is intentionally unchanged. The ORM normalizes values to UTC, stores a timezone-free Oracle
+`TIMESTAMP`, and restores UTC awareness when reading. The database-copy verifier compares all
+fields and detects any lost timestamp precision, JSON changes, or text encoding differences.

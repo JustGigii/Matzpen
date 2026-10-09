@@ -79,6 +79,8 @@ class CommitmentExtraction(BaseModel):
     requires_user_confirmation: bool = False
     ambiguous: bool = False
     needs_clarification: bool = False
+    clarification_question: str | None = Field(default=None, max_length=500)
+    clarification_options: list[str] = Field(default_factory=list, max_length=4)
     calendar_worthy: bool = False
     calendar_event: CalendarProposal | None = None
     timetable_rows: list[TimetableRow] = Field(default_factory=list, max_length=100)
@@ -196,3 +198,42 @@ class MorningBriefResponse(BaseModel):
     generated: bool
     sent: bool
     trigger_source: str
+
+
+class ChatTurn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=4000)
+
+
+class MemoryContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    category: str = Field(min_length=1, max_length=100)
+    subject: str = Field(min_length=1, max_length=500)
+    predicate: str = Field(min_length=1, max_length=500)
+    value: str = Field(min_length=1, max_length=2000)
+
+
+class MemoryCandidate(MemoryContext):
+    confidence: float = Field(ge=0, le=1)
+    sensitivity: Sensitivity = Sensitivity.PERSONAL
+
+
+class ChatRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message: str = Field(min_length=1, max_length=4000)
+    recent_turns: list[ChatTurn] = Field(default_factory=list, max_length=12)
+    confirmed_memories: list[MemoryContext] = Field(default_factory=list, max_length=50)
+    active_items: list[str] = Field(default_factory=list, max_length=30)
+    recent_notifications: list[str] = Field(default_factory=list, max_length=10)
+    upcoming_calendar: list[str] = Field(default_factory=list, max_length=30)
+
+
+class ChatResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reply: str = Field(min_length=1, max_length=4000)
+    memory_candidates: list[MemoryCandidate] = Field(default_factory=list, max_length=5)

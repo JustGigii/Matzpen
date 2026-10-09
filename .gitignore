@@ -14,3 +14,7 @@ htmlcov/
 secrets/
 credentials*.json
 token*.json
+.codex_deploy_*/
+deployment_bundle/
+*.zip
+*.tar.gz

@@ -76,6 +76,23 @@ class FakeTelegramNotifier:
         )
         return message_id
 
+    async def detail_clarification_request(
+        self,
+        approval_id: str,
+        summary: str,
+        question: str,
+        options: tuple[str, ...],
+    ) -> str:
+        message_id = f"fake-{len(self.notifications) + 1}"
+        self.notifications.append(
+            Notification(
+                kind="detail_clarification_request",
+                text=f"{summary}; question={question}; choices={options}",
+                reference_id=approval_id,
+            )
+        )
+        return message_id
+
     async def workflow_confirmation(self, message_id: str | None, text: str) -> str:
         if message_id is not None and message_id.startswith("fake-"):
             index = int(message_id.removeprefix("fake-")) - 1
@@ -95,6 +112,28 @@ class FakeTelegramNotifier:
             Notification(
                 kind="timetable_request",
                 text=f"{summary}; rows={row_count}",
+                reference_id=approval_id,
+            )
+        )
+        return message_id
+
+    async def group_tracking_request(self, conversation_id: str, display_name: str) -> str:
+        message_id = f"fake-{len(self.notifications) + 1}"
+        self.notifications.append(
+            Notification(
+                kind="group_tracking_request",
+                text=f"Track WhatsApp group: {display_name}",
+                reference_id=conversation_id,
+            )
+        )
+        return message_id
+
+    async def memory_request(self, approval_id: str, summary: str) -> str:
+        message_id = f"fake-{len(self.notifications) + 1}"
+        self.notifications.append(
+            Notification(
+                kind="memory_request",
+                text=f"Remember this? {summary}",
                 reference_id=approval_id,
             )
         )

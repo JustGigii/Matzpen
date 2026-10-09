@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from personal_agent.core.config import Settings
 from personal_agent.domain.enums import (
     ApprovalStatus,
+    CalendarActionStatus,
     EventDirection,
     HistoricalFindingStatus,
     WhatsAppBufferStatus,
@@ -21,14 +22,23 @@ from personal_agent.domain.enums import (
 )
 from personal_agent.domain.models import (
     ApprovalRequest,
+    CalendarAction,
+    Commitment,
     Event,
     Person,
+    Reminder,
     Task,
+    WhatsAppConversation,
     WhatsAppConversationBuffer,
     WhatsAppHistoricalFinding,
     WhatsAppSessionState,
 )
 from personal_agent.domain.schemas import CommitmentExtraction, ExtractionResult
+from personal_agent.integrations.google_calendar.fake import FakeCalendarProvider
+from personal_agent.integrations.llm.base import (
+    LLMQuotaExceededError,
+    LLMServiceUnavailableError,
+)
 from personal_agent.integrations.llm.fake import FakeLLMProvider
 from personal_agent.integrations.openwa.client import HttpOpenWAReadClient, OpenWAMediaContent
 from personal_agent.integrations.openwa.fake import FakeOpenWAReadClient
@@ -36,6 +46,7 @@ from personal_agent.integrations.openwa.schemas import OpenWAEventData, OpenWAHi
 from personal_agent.integrations.openwa.signature import OpenWASignatureVerifier
 from personal_agent.integrations.telegram.fake import FakeTelegramNotifier
 from personal_agent.main import create_app
+from personal_agent.services.confirmations import ConfirmationService
 from personal_agent.services.whatsapp import WhatsAppService
 
 
@@ -91,12 +102,13 @@ def build_app(
     database_path: Path,
     clock: MutableClock,
     *,
-    results: list[ExtractionResult] | None = None,
+    results: list[ExtractionResult | Exception] | None = None,
     media_texts: list[str] | None = None,
     openwa_client: FakeOpenWAReadClient | None = None,
     configured: bool = False,
     ignored_chat_ids: tuple[str, ...] = (),
     webhook_max_bytes: int = 1_048_576,
+    calendar_provider: FakeCalendarProvider | None = None,
 ) -> FastAPI:
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{database_path.as_posix()}",
@@ -106,6 +118,7 @@ def build_app(
         openwa_api_key="fake-api-key" if configured else None,
         openwa_session_id="fake-session" if configured else None,
         whatsapp_ignored_chat_ids=ignored_chat_ids,
+        whatsapp_prompt_new_groups=True,
         proactive_check_interval_seconds=3600,
         internal_action_grace_seconds=60,
         gemini_api_key=None,
@@ -120,11 +133,230 @@ def build_app(
         settings=settings,
         llm_provider=FakeLLMProvider(results, media_texts=media_texts),
         notifier=FakeTelegramNotifier(),
+        calendar_provider=calendar_provider,
         openwa_client=openwa_client,
         clock=clock,
     )
     app.state.control.pause()
     return app
+
+
+async def test_private_zoom_conversation_keeps_follow_up_context_and_builds_full_flow(
+    tmp_path: Path,
+) -> None:
+    start = datetime(2026, 8, 3, 15, 28, 37, tzinfo=UTC)
+    meeting_at = datetime(2026, 8, 4, 16, 0, tzinfo=UTC)
+    clock = MutableClock(start)
+    calendar = FakeCalendarProvider()
+    app = build_app(
+        tmp_path / "zoom-conversation.db",
+        clock,
+        results=[
+            ExtractionResult(
+                language="he",
+                items=[
+                    CommitmentExtraction(
+                        kind="commitment",
+                        summary="שיחת Zoom עם Shaked Aviv",
+                        action_type="meet",
+                        due_at=meeting_at,
+                        confidence=0.99,
+                        evidence=("בוא נקבע שיחת זום; מחר בשעה 7 אשלח קישור; בערב כמובן"),
+                    ),
+                ],
+            )
+        ],
+        calendar_provider=calendar,
+    )
+
+    async with app_client(app) as client:
+        incoming = make_payload(
+            "zoom-in",
+            "בוא נקבע שיחת זום",
+            chat_id="shaked-chat",
+            timestamp="2026-08-03T15:28:37Z",
+            chatName="Shaked Aviv",
+        )
+        first = await signed_post(client, incoming)
+        clock.value = start + timedelta(seconds=13)
+        reply = make_payload(
+            "zoom-out",
+            "מצוין מחר בשעה 7 אשלח קישור",
+            event="message.sent",
+            chat_id="shaked-chat",
+            from_me=True,
+            timestamp="2026-08-03T15:28:50Z",
+            chatName="Shaked Aviv",
+        )
+        second = await signed_post(client, reply)
+        clock.value = start + timedelta(seconds=22)
+        clarification = make_payload(
+            "zoom-evening",
+            "בערב כמובן",
+            event="message.sent",
+            chat_id="shaked-chat",
+            from_me=True,
+            timestamp="2026-08-03T15:28:59Z",
+            chatName="Shaked Aviv",
+        )
+        third = await signed_post(client, clarification)
+
+        assert first.json()["buffer_id"] == second.json()["buffer_id"]
+        assert second.json()["buffer_id"] == third.json()["buffer_id"]
+        clock.value = start + timedelta(minutes=3)
+        whatsapp = cast(WhatsAppService, app.state.whatsapp_service)
+        assert await whatsapp.flush_due_buffers() == 1
+
+        llm = cast(FakeLLMProvider, app.state.llm_provider)
+        request_text = llm.requests[0].content_text
+        assert "בוא נקבע שיחת זום" in request_text
+        assert "מחר בשעה 7 אשלח קישור" in request_text
+        assert "בערב כמובן" in request_text
+        assert llm.requests[0].conversation_display_name == "Shaked Aviv"
+
+        notifier = cast(FakeTelegramNotifier, app.state.notifier)
+        assert [notification.kind for notification in notifier.notifications] == [
+            "approval_request",
+            "approval_request",
+        ]
+        meeting_card = notifier.notifications[0].text
+        assert "04.08.2026 בשעה 19:00" in meeting_card
+        assert "Google Calendar" in meeting_card
+        assert "WhatsApp עם Shaked Aviv" in meeting_card
+        assert "התראות: 10 דקות לפני, 30 דקות לפני" in meeting_card
+        assert "ביטחון" not in meeting_card
+
+        factory = cast(async_sessionmaker[AsyncSession], app.state.session_factory)
+        async with factory() as session:
+            approvals = list((await session.scalars(select(ApprovalRequest))).all())
+            assert len(approvals) == 2
+            meeting_item = approvals[0].action_payload["item"]
+            link_item = approvals[1].action_payload["item"]
+            assert meeting_item["calendar_worthy"] is True
+            assert meeting_item["calendar_event"]["start"] == "2026-08-04T16:00:00Z"
+            assert link_item["summary"] == "לשלוח קישור לפגישת Zoom עם Shaked Aviv"
+            assert link_item["calendar_worthy"] is False
+            assert all(approval.execute_after is None for approval in approvals)
+            assert await session.scalar(select(func.count()).select_from(Commitment)) == 0
+
+        confirmations = cast(ConfirmationService, app.state.confirmation_service)
+        for approval in approvals:
+            assert await confirmations.resolve(approval.id, approve=True) is True
+
+        async with factory() as session:
+            commitments = list((await session.scalars(select(Commitment))).all())
+            action = (await session.scalars(select(CalendarAction))).one()
+            reminders = list((await session.scalars(select(Reminder))).all())
+            assert len(commitments) == 2
+            assert action.status is CalendarActionStatus.EXECUTED
+            assert len(reminders) == 4
+        assert len(calendar.events) == 1
+
+
+async def test_whatsapp_quota_alerts_telegram_once_and_retries_the_buffer(
+    tmp_path: Path,
+) -> None:
+    start = datetime(2026, 8, 1, 9, 0, tzinfo=UTC)
+    clock = MutableClock(start)
+    app = build_app(
+        tmp_path / "quota-retry.db",
+        clock,
+        results=[
+            LLMQuotaExceededError(40, daily_limit=True),
+            LLMQuotaExceededError(40, daily_limit=True),
+            ExtractionResult(language="he", items=[]),
+        ],
+    )
+
+    async with app_client(app) as client:
+        response = await signed_post(
+            client,
+            make_payload(
+                "quota-message",
+                "אשלח מחר את הקובץ",
+                event="message.sent",
+                from_me=True,
+                timestamp="2026-08-01T09:00:00Z",
+            ),
+        )
+        assert response.json()["buffered"] is True
+
+        whatsapp = cast(WhatsAppService, app.state.whatsapp_service)
+        notifier = cast(FakeTelegramNotifier, app.state.notifier)
+        factory = cast(async_sessionmaker[AsyncSession], app.state.session_factory)
+
+        clock.value = start + timedelta(minutes=3)
+        assert await whatsapp.flush_due_buffers() == 0
+        assert [item.kind for item in notifier.notifications] == ["text"]
+        assert "מכסת שירות ה-AI נוצלה" in notifier.notifications[0].text
+
+        async with factory() as session:
+            buffer = (await session.scalars(select(WhatsAppConversationBuffer))).one()
+            failed_batch = (
+                await session.scalars(select(Event).where(Event.event_type == "conversation.batch"))
+            ).one()
+            assert buffer.status is WhatsAppBufferStatus.PENDING
+            assert failed_batch.processing_status.value == "failed"
+            assert failed_batch.payload_json["retryable_failure"] == "llm_quota"
+
+        clock.value = start + timedelta(minutes=4)
+        assert await whatsapp.flush_due_buffers() == 0
+        assert len(notifier.notifications) == 1
+
+        clock.value = start + timedelta(minutes=20)
+        assert await whatsapp.flush_due_buffers() == 1
+        async with factory() as session:
+            buffer = (await session.scalars(select(WhatsAppConversationBuffer))).one()
+            recovered_batch = (
+                await session.scalars(select(Event).where(Event.event_type == "conversation.batch"))
+            ).one()
+            assert buffer.status is WhatsAppBufferStatus.PROCESSED
+            assert recovered_batch.processing_status.value == "processed"
+            assert "retryable_failure" not in recovered_batch.payload_json
+
+
+async def test_whatsapp_gemini_unavailability_is_reported_and_retried(
+    tmp_path: Path,
+) -> None:
+    start = datetime(2026, 8, 1, 9, 0, tzinfo=UTC)
+    clock = MutableClock(start)
+    app = build_app(
+        tmp_path / "unavailable-retry.db",
+        clock,
+        results=[
+            LLMServiceUnavailableError(30),
+            ExtractionResult(language="he", items=[]),
+        ],
+    )
+
+    async with app_client(app) as client:
+        response = await signed_post(
+            client,
+            make_payload(
+                "unavailable-message",
+                "אשלח מחר את הקובץ",
+                event="message.sent",
+                from_me=True,
+                timestamp="2026-08-01T09:00:00Z",
+            ),
+        )
+        assert response.json()["buffered"] is True
+
+        whatsapp = cast(WhatsAppService, app.state.whatsapp_service)
+        notifier = cast(FakeTelegramNotifier, app.state.notifier)
+        clock.value = start + timedelta(minutes=3)
+        assert await whatsapp.flush_due_buffers() == 0
+        assert "שירות ה-AI עמוס זמנית" in notifier.notifications[0].text
+
+        factory = cast(async_sessionmaker[AsyncSession], app.state.session_factory)
+        async with factory() as session:
+            failed_batch = (
+                await session.scalars(select(Event).where(Event.event_type == "conversation.batch"))
+            ).one()
+            assert failed_batch.payload_json["retryable_failure"] == "llm_unavailable"
+
+        clock.value = start + timedelta(minutes=5)
+        assert await whatsapp.flush_due_buffers() == 1
 
 
 @asynccontextmanager
@@ -384,6 +616,86 @@ async def test_group_archive_and_denylist_rules_are_local_and_deterministic(
         assert llm.requests == []
 
 
+async def test_new_group_prompts_once_and_tracked_plans_stay_proposal_only(
+    tmp_path: Path,
+) -> None:
+    start = datetime(2026, 8, 2, 14, 0, tzinfo=UTC)
+    clock = MutableClock(start)
+    openwa_client = FakeOpenWAReadClient(
+        chat_display_names={"wedding@g.us": "\u05d7\u05d1\u05d5 \u05d7\u05d5\u05e4\u05d4"}
+    )
+    app = build_app(
+        tmp_path / "tracked-groups.db",
+        clock,
+        results=[
+            extraction(
+                kind="commitment",
+                summary="\u05de\u05e4\u05d2\u05e9 \u05e7\u05d1\u05d5\u05e6\u05ea\u05d9",
+            )
+        ],
+        openwa_client=openwa_client,
+    )
+    joined = {
+        "event": "group.join",
+        "sessionId": "fake-session",
+        "deliveryId": "group-join-1",
+        "data": {
+            "groupId": "wedding@g.us",
+            "timestamp": "2026-08-02T14:00:00Z",
+        },
+    }
+
+    async with app_client(app) as client:
+        join_response = await signed_post(client, joined)
+        whatsapp = cast(WhatsAppService, app.state.whatsapp_service)
+        await whatsapp.wait_for_background_work()
+
+        notifier = cast(FakeTelegramNotifier, app.state.notifier)
+        assert join_response.status_code == 202
+        assert [item.kind for item in notifier.notifications] == ["group_tracking_request"]
+        assert "\u05d7\u05d1\u05d5 \u05d7\u05d5\u05e4\u05d4" in notifier.notifications[0].text
+
+        session_factory = cast(async_sessionmaker[AsyncSession], app.state.session_factory)
+        async with session_factory() as session:
+            conversation = (await session.scalars(select(WhatsAppConversation))).one()
+            conversation_id = conversation.id
+            assert conversation.tracking_enabled is False
+
+        assert await whatsapp.set_group_tracking(conversation_id, enabled=True) is not None
+        plan_response = await signed_post(
+            client,
+            make_payload(
+                "group-plan-1",
+                (
+                    "\u05e0\u05e4\u05d2\u05e9\u05d9\u05dd \u05de\u05d7\u05e8 "
+                    "\u05d1\u05e9\u05e2\u05d4 20:00"
+                ),
+                chat_id="wedding@g.us",
+                isGroup=True,
+            ),
+        )
+        assert plan_response.json()["buffered"] is True
+
+        clock.value = start + timedelta(minutes=2)
+        assert await whatsapp.flush_due_buffers() == 1
+        async with session_factory() as session:
+            approval = (await session.scalars(select(ApprovalRequest))).one()
+            assert approval.status is ApprovalStatus.PENDING
+            assert await session.scalar(select(func.count()).select_from(Task)) == 0
+
+        llm = cast(FakeLLMProvider, app.state.llm_provider)
+        assert llm.requests[0].conversation_type == "group"
+        assert (
+            llm.requests[0].conversation_display_name
+            == "\u05d7\u05d1\u05d5 \u05d7\u05d5\u05e4\u05d4"
+        )
+        assert [item.kind for item in notifier.notifications] == [
+            "group_tracking_request",
+            "approval_request",
+        ]
+        assert "מקור: קבוצת WhatsApp — חבו חופה" in notifier.notifications[1].text
+
+
 async def test_initial_seven_day_history_is_capped_review_only_and_watermarked(
     tmp_path: Path,
 ) -> None:
@@ -600,7 +912,7 @@ async def test_supported_media_is_transient_video_and_oversize_are_rejected_and_
 
         whatsapp = cast(WhatsAppService, app.state.whatsapp_service)
         assert await whatsapp.flush_due_buffers(now + timedelta(minutes=5)) == 1
-        assert read_client.media_requests == [("fake-session", "voice-1")]
+        assert read_client.media_requests == [("fake-session", "private-chat", "voice-1")]
         llm = cast(FakeLLMProvider, app.state.llm_provider)
         assert llm.media_requests == [("audio/ogg", "voice.ogg", 16)]
         assert "תזכיר לי פגישה מחר" in llm.requests[0].content_text
@@ -627,6 +939,78 @@ async def test_supported_media_is_transient_video_and_oversize_are_rejected_and_
             assert expired_event.content_text is None
             assert expired_event.payload_json["redacted"] is True
             assert expired_event.dedupe_key
+
+
+async def test_group_voice_requires_tracking_and_is_transcribed_when_enabled(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 1, 9, 0, tzinfo=UTC)
+    clock = MutableClock(now)
+    group_id = "voice-group@g.us"
+    read_client = FakeOpenWAReadClient(
+        chat_display_names={group_id: "\u05e7\u05d1\u05d5\u05e6\u05ea \u05e7\u05d5\u05dc"},
+        media={
+            "group-voice-tracked": OpenWAMediaContent(
+                content=b"tracked-group-voice",
+                mime_type="audio/ogg",
+                filename="group-voice.ogg",
+            )
+        },
+    )
+    transcript = (
+        "\u05e7\u05d1\u05e2\u05e0\u05d5 \u05e4\u05d2\u05d9\u05e9\u05d4 "
+        "\u05de\u05d7\u05e8 \u05d1\u05e9\u05e2\u05d4 20:00"
+    )
+    app = build_app(
+        tmp_path / "group-voice.db",
+        clock,
+        results=[ExtractionResult(language="he", items=[])],
+        media_texts=[transcript],
+        openwa_client=read_client,
+    )
+
+    async with app_client(app) as client:
+        untracked = make_payload(
+            "group-voice-untracked",
+            None,
+            chat_id=group_id,
+            isGroup=True,
+            messageType="voice",
+            media={"type": "voice", "mimeType": "audio/ogg", "size": 16},
+        )
+        response = await signed_post(client, untracked)
+        assert response.json()["ignored_reason"] == "unaddressed_group_message"
+
+        whatsapp = cast(WhatsAppService, app.state.whatsapp_service)
+        await whatsapp.wait_for_background_work()
+        session_factory = cast(async_sessionmaker[AsyncSession], app.state.session_factory)
+        async with session_factory() as session:
+            conversation = (
+                await session.scalars(
+                    select(WhatsAppConversation).where(
+                        WhatsAppConversation.external_chat_id == group_id
+                    )
+                )
+            ).one()
+            conversation_id = conversation.id
+
+        assert await whatsapp.set_group_tracking(conversation_id, enabled=True) is not None
+        tracked = make_payload(
+            "group-voice-tracked",
+            None,
+            chat_id=group_id,
+            isGroup=True,
+            messageType="voice",
+            media={"type": "voice", "mimeType": "audio/ogg", "size": 19},
+        )
+        assert (await signed_post(client, tracked)).json()["buffered"] is True
+
+        clock.value = now + timedelta(minutes=5)
+        assert await whatsapp.flush_due_buffers() == 1
+        assert read_client.media_requests == [("fake-session", group_id, "group-voice-tracked")]
+        llm = cast(FakeLLMProvider, app.state.llm_provider)
+        assert llm.media_requests == [("audio/ogg", "group-voice.ogg", 19)]
+        assert transcript in llm.requests[0].content_text
 
 
 async def test_connectivity_status_warning_body_limit_and_read_only_surface(
@@ -675,6 +1059,9 @@ async def test_connectivity_status_warning_body_limit_and_read_only_surface(
         }
         await signed_post(client, connected_payload)
         assert len(notifier.notifications) == 3
+        connected_status = (await client.get("/api/status")).json()["whatsapp"]
+        assert connected_status["session_state"] == "connected"
+        assert connected_status["disconnected_seconds"] is None
 
         oversized_body = b"{" + b"x" * 1024 + b"}"
         signature = OpenWASignatureVerifier("test-webhook-secret").sign(oversized_body)

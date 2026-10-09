@@ -26,7 +26,7 @@ class FakeOpenWAReadClient:
         self.history_rows = list(history)
         self.media = dict(media or {})
         self.history_requests: list[tuple[str, datetime, int, int]] = []
-        self.media_requests: list[tuple[str, str]] = []
+        self.media_requests: list[tuple[str, str, str]] = []
         self.closed = False
 
     async def connection_status(self, session_id: str) -> OpenWAConnectionSnapshot:
@@ -66,8 +66,10 @@ class FakeOpenWAReadClient:
                 break
         return result
 
-    async def download_media(self, session_id: str, message_id: str) -> OpenWAMediaContent | None:
-        self.media_requests.append((session_id, message_id))
+    async def download_media(
+        self, session_id: str, chat_id: str, message_id: str
+    ) -> OpenWAMediaContent | None:
+        self.media_requests.append((session_id, chat_id, message_id))
         return self.media.get(message_id)
 
     async def aclose(self) -> None:

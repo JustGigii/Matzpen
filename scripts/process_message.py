@@ -84,6 +84,7 @@ async def run(message: str, event_id: str | None = None) -> None:
                 lifecycle=lifecycle,
                 now=utc_now,
                 reminder_lead_minutes=settings.default_reminder_lead_minutes,
+                timezone=settings.timezone,
                 clarification_fallback_minutes=settings.clarification_fallback_minutes,
                 approval_expiry_hours=settings.approval_expiry_hours,
             )

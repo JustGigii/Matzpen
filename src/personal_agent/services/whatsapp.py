@@ -37,6 +37,7 @@ from personal_agent.domain.models import (
     WhatsAppSessionState,
 )
 from personal_agent.domain.schemas import IntakeResult, NormalizedEvent
+from personal_agent.integrations.llm.base import LLMRetryableError
 from personal_agent.integrations.openwa.client import OpenWAReadClient
 from personal_agent.integrations.openwa.schemas import (
     OpenWAEventData,
@@ -44,6 +45,7 @@ from personal_agent.integrations.openwa.schemas import (
     OpenWAWebhookResponse,
 )
 from personal_agent.integrations.telegram.base import TelegramNotifier
+from personal_agent.integrations.telegram.presentation import retryable_llm_message
 from personal_agent.repositories.events import EventRepository
 from personal_agent.services.intake import IntakeService
 from personal_agent.services.media import MediaAttachment, MediaTextService, MediaValidationError
@@ -61,6 +63,7 @@ SESSION_EVENTS = {
     "session.authenticated",
     "session.qr",
 }
+GROUP_EVENTS = {"group.join", "group.leave", "group.update"}
 SUPPORTED_MEDIA_TYPES = {
     "audio",
     "voice",
@@ -73,8 +76,15 @@ SUPPORTED_MEDIA_TYPES = {
 IRRELEVANT_TEXT = re.compile(r"^(?:[😂🤣😁😀🙂👍🙏❤️❤]+|חח+(?:ה+)?|lol+|ok|סבבה)$", re.I)
 RELEVANT_TEXT = re.compile(
     r"(?:\b\d{1,2}[:.]\d{2}\b|\bמחר\b|\bהיום\b|\bdeadline\b|\bmeeting\b|"
-    r"\binterview\b|\bsubmit\b|\bcall\b|\bappointment\b|תזכיר|דדליין|להגיש|פגישה|"
-    r"ראיון|שיעור|תחזור|אחזור|אתקשר|אשלח|אקבע|אעשה|תשלח|תתקשר|צריך|אפשר)",
+    r"\binterview\b|\bsubmit\b|\bcall\b|\bappointment\b|\bzoom\b|תזכיר|דדליין|"
+    r"להגיש|פגישה|שיחת|זום|נקבע|קבענו|קבעתי|ראיון|שיעור|תחזור|אחזור|אתקשר|אשלח|"
+    r"אקבע|אעשה|תשלח|תתקשר|צריך|אפשר)",
+    re.I,
+)
+GROUP_PLAN_TEXT = re.compile(
+    r"(?:\u05e0\u05e4\u05d2\u05e9|\u05e0\u05d9\u05e4\u05d2\u05e9|\u05e0\u05e4\u05d2\u05e9\u05d9\u05dd|"
+    r"\u05e7\u05d1\u05e2\u05d5|\u05e0\u05e7\u05d1\u05e2|\u05de\u05d2\u05d9\u05e2|\u05d0\u05d2\u05d9\u05e2|\u05ea\u05d2\u05d9\u05e2|"
+    r"\u05e0\u05d3\u05d7\u05d4|\u05d3\u05d7\u05d5|\u05d1\u05d5\u05d8\u05dc|\u05d1\u05d9\u05d8\u05dc\u05d5|\u05de\u05e0\u05d2\u05dc|\u05d0\u05d9\u05e8\u05d5\u05e2)",
     re.I,
 )
 RELATIVE_MINUTES_TEXT = re.compile(
@@ -114,6 +124,7 @@ class WhatsAppService:
         self._lock = asyncio.Lock()
         self._timezone = ZoneInfo(settings.timezone)
         self._background_tasks: set[asyncio.Task[None]] = set()
+        self._last_quota_notification_at: datetime | None = None
 
     async def handle_webhook(self, webhook: OpenWAWebhook) -> OpenWAWebhookResponse:
         received_at = require_aware(self._now())
@@ -125,6 +136,8 @@ class WhatsAppService:
             )
         if webhook.event == "call.received":
             return await self._store_call_event(webhook, received_at)
+        if webhook.event in GROUP_EVENTS:
+            return await self._handle_group_event(webhook, received_at)
         if webhook.event not in MESSAGE_EVENTS:
             return OpenWAWebhookResponse(accepted=False, ignored_reason="unsupported_event")
 
@@ -140,6 +153,15 @@ class WhatsAppService:
 
         async with self._lock, self._session_factory() as session:
             conversation = await self._upsert_conversation(session, webhook, received_at)
+            if (
+                conversation.chat_type is WhatsAppConversationType.GROUP
+                and self._settings.whatsapp_prompt_new_groups
+                and not conversation.ignored
+                and not conversation.tracking_enabled
+                and conversation.tracking_prompted_at is None
+            ):
+                conversation.tracking_prompted_at = received_at
+                self._schedule_group_tracking_prompt(conversation.id)
             event, created = await self._store_message_event(session, webhook, received_at)
             if not created:
                 await session.commit()
@@ -170,7 +192,12 @@ class WhatsAppService:
                     )
 
             ignored_reason = self._ignored_reason(conversation, data)
-            if ignored_reason is not None:
+            keep_as_context = await self._should_buffer_as_conversation_context(
+                session,
+                conversation,
+                ignored_reason,
+            )
+            if ignored_reason is not None and not keep_as_context:
                 event.processing_status = ProcessingStatus.PROCESSED
                 session.add(
                     AuditLog(
@@ -187,6 +214,18 @@ class WhatsAppService:
                     accepted=True,
                     event_id=str(event.id),
                     ignored_reason=ignored_reason,
+                )
+
+            if keep_as_context:
+                session.add(
+                    AuditLog(
+                        actor="whatsapp_service",
+                        action="retain_whatsapp_context",
+                        target=str(event.id),
+                        source_event_id=event.id,
+                        result="buffered_with_active_conversation",
+                        redacted_metadata={"original_filter_reason": ignored_reason},
+                    )
                 )
 
             await self._upsert_person(session, event, conversation, data)
@@ -212,6 +251,49 @@ class WhatsAppService:
                 buffer_id=str(buffer.id),
             )
 
+    async def _handle_group_event(
+        self, webhook: OpenWAWebhook, received_at: datetime
+    ) -> OpenWAWebhookResponse:
+        data = webhook.data
+        if data.chat_id is None:
+            return OpenWAWebhookResponse(
+                accepted=False,
+                ignored_reason="missing_group_identity",
+            )
+        if not data.is_group:
+            data = data.model_copy(update={"is_group": True})
+            webhook = webhook.model_copy(update={"data": data})
+        async with self._lock, self._session_factory() as session:
+            conversation = await self._upsert_conversation(session, webhook, received_at)
+            event, created = await self._store_message_event(session, webhook, received_at)
+            event.processing_status = ProcessingStatus.PROCESSED
+            if webhook.event == "group.leave":
+                conversation.tracking_enabled = False
+                conversation.tracking_prompted_at = None
+            elif (
+                self._settings.whatsapp_prompt_new_groups
+                and not conversation.ignored
+                and not conversation.tracking_enabled
+                and conversation.tracking_prompted_at is None
+            ):
+                conversation.tracking_prompted_at = received_at
+                self._schedule_group_tracking_prompt(conversation.id)
+            session.add(
+                AuditLog(
+                    actor="whatsapp_service",
+                    action="handle_whatsapp_group_event",
+                    target=str(conversation.id),
+                    source_event_id=event.id,
+                    result=webhook.event,
+                )
+            )
+            await session.commit()
+        return OpenWAWebhookResponse(
+            accepted=True,
+            duplicate=not created,
+            event_id=str(event.id),
+        )
+
     async def stop(self) -> None:
         """Cancel any best-effort immediate flushes during application shutdown."""
         tasks = tuple(self._background_tasks)
@@ -225,6 +307,67 @@ class WhatsAppService:
         tasks = tuple(self._background_tasks)
         if tasks:
             await asyncio.gather(*tasks)
+
+    async def set_group_tracking(self, conversation_id: uuid.UUID, *, enabled: bool) -> str | None:
+        """Apply the user's explicit Telegram choice for one discovered WhatsApp group."""
+        async with self._lock, self._session_factory() as session:
+            conversation = await session.get(WhatsAppConversation, conversation_id)
+            if conversation is None or conversation.chat_type is not WhatsAppConversationType.GROUP:
+                return None
+            conversation.tracking_enabled = enabled
+            conversation.tracking_prompted_at = require_aware(self._now())
+            if not enabled:
+                pending_buffers = list(
+                    (
+                        await session.scalars(
+                            select(WhatsAppConversationBuffer).where(
+                                WhatsAppConversationBuffer.conversation_id == conversation.id,
+                                WhatsAppConversationBuffer.status == WhatsAppBufferStatus.PENDING,
+                            )
+                        )
+                    ).all()
+                )
+                for buffer in pending_buffers:
+                    buffer.status = WhatsAppBufferStatus.CANCELLED
+            session.add(
+                AuditLog(
+                    actor="telegram_user",
+                    action="set_whatsapp_group_tracking",
+                    target=str(conversation.id),
+                    result="enabled" if enabled else "disabled",
+                    redacted_metadata={"chat_type": "group"},
+                )
+            )
+            await session.commit()
+            return conversation.display_name or conversation.external_chat_id
+
+    def _schedule_group_tracking_prompt(self, conversation_id: uuid.UUID) -> None:
+        task = asyncio.create_task(
+            self._send_group_tracking_prompt(conversation_id),
+            name="whatsapp-group-tracking-prompt",
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _send_group_tracking_prompt(self, conversation_id: uuid.UUID) -> None:
+        try:
+            async with self._lock:
+                async with self._session_factory() as session:
+                    conversation = await session.get(WhatsAppConversation, conversation_id)
+                    if conversation is None or conversation.tracking_enabled:
+                        return
+            await self._resolve_conversation_display_name(conversation)
+            await self._notifier.group_tracking_request(
+                str(conversation.id),
+                conversation.display_name or conversation.external_chat_id,
+            )
+        except Exception:
+            logger.exception("WhatsApp group tracking prompt failed")
+            async with self._session_factory() as session:
+                conversation = await session.get(WhatsAppConversation, conversation_id)
+                if conversation is not None and not conversation.tracking_enabled:
+                    conversation.tracking_prompted_at = None
+                    await session.commit()
 
     def _schedule_immediate_flush(self) -> None:
         """Process time-bound outbound commitments without delaying the webhook response."""
@@ -262,27 +405,65 @@ class WhatsAppService:
             await session.commit()
 
         processed = 0
-        for buffer_id in buffer_ids:
+        for index, buffer_id in enumerate(buffer_ids):
             try:
                 if await self._flush_buffer(buffer_id, effective_at):
                     processed += 1
+            except LLMRetryableError as exc:
+                retry_seconds = max(60, exc.retry_after_seconds or 60)
+                await self._reschedule_buffers(
+                    buffer_ids[index:],
+                    effective_at + timedelta(seconds=retry_seconds),
+                    "llm_quota_retry_scheduled",
+                )
+                await self._notify_quota_if_due(exc, effective_at)
+                return processed
             except Exception:
-                async with self._session_factory() as session:
-                    retry_buffer = await session.get(WhatsAppConversationBuffer, buffer_id)
-                    if retry_buffer is not None:
-                        retry_buffer.status = WhatsAppBufferStatus.PENDING
-                        retry_buffer.flush_at = effective_at + timedelta(seconds=60)
-                        session.add(
-                            AuditLog(
-                                actor="whatsapp_service",
-                                action="flush_conversation_buffer",
-                                target=str(retry_buffer.id),
-                                result="retry_scheduled",
-                            )
-                        )
-                        await session.commit()
+                await self._reschedule_buffers(
+                    [buffer_id],
+                    effective_at + timedelta(seconds=60),
+                    "retry_scheduled",
+                )
                 raise
         return processed
+
+    async def _reschedule_buffers(
+        self,
+        buffer_ids: Sequence[uuid.UUID],
+        retry_at: datetime,
+        result: str,
+    ) -> None:
+        async with self._session_factory() as session:
+            for buffer_id in buffer_ids:
+                retry_buffer = await session.get(WhatsAppConversationBuffer, buffer_id)
+                if retry_buffer is None:
+                    continue
+                retry_buffer.status = WhatsAppBufferStatus.PENDING
+                retry_buffer.flush_at = retry_at
+                session.add(
+                    AuditLog(
+                        actor="whatsapp_service",
+                        action="flush_conversation_buffer",
+                        target=str(retry_buffer.id),
+                        result=result,
+                    )
+                )
+            await session.commit()
+
+    async def _notify_quota_if_due(
+        self,
+        error: LLMRetryableError,
+        effective_at: datetime,
+    ) -> None:
+        if (
+            self._last_quota_notification_at is not None
+            and effective_at - self._last_quota_notification_at < timedelta(minutes=15)
+        ):
+            return
+        await self._notifier.send_text(
+            "העיבוד האוטומטי של שיחת WhatsApp נעצר זמנית.\n\n" + retryable_llm_message(error)
+        )
+        self._last_quota_notification_at = effective_at
 
     async def _flush_buffer(self, buffer_id: uuid.UUID, effective_at: datetime) -> bool:
         async with self._session_factory() as session:
@@ -422,11 +603,7 @@ class WhatsAppService:
                 "whatsapp_source_event_ids": [str(event.id) for event in events],
                 "force_confirmation": force_confirmation,
                 "conversation_type": conversation.chat_type.value,
-                "conversation_display_name": (
-                    conversation.display_name
-                    if conversation.chat_type is WhatsAppConversationType.PRIVATE
-                    else None
-                ),
+                "conversation_display_name": conversation.display_name,
                 "urgent_bypass": urgent,
                 "untrusted_source": True,
             },
@@ -442,7 +619,10 @@ class WhatsAppService:
         if not isinstance(media_payload, dict) or self._read_client is None:
             return None
         message_id = event.external_id
-        downloaded = await self._read_client.download_media(session_id, message_id)
+        chat_id = event.conversation_external_id
+        if not chat_id:
+            return None
+        downloaded = await self._read_client.download_media(session_id, chat_id, message_id)
         if downloaded is None:
             return None
         if len(downloaded.content) > self._settings.whatsapp_max_media_bytes:
@@ -895,6 +1075,26 @@ class WhatsAppService:
             buffer.flush_at = min(buffer.flush_at, flush_at) if buffer.urgent else flush_at
         return buffer
 
+    async def _should_buffer_as_conversation_context(
+        self,
+        session: AsyncSession,
+        conversation: WhatsAppConversation,
+        ignored_reason: str | None,
+    ) -> bool:
+        """Retain short follow-up turns when a relevant private conversation is active."""
+        if conversation.chat_type is not WhatsAppConversationType.PRIVATE or ignored_reason not in {
+            "local_noise_filter",
+            "not_locally_relevant",
+        }:
+            return False
+        pending_buffer = await session.scalar(
+            select(WhatsAppConversationBuffer.id).where(
+                WhatsAppConversationBuffer.conversation_id == conversation.id,
+                WhatsAppConversationBuffer.status == WhatsAppBufferStatus.PENDING,
+            )
+        )
+        return pending_buffer is not None
+
     async def _upsert_person(
         self,
         session: AsyncSession,
@@ -1136,9 +1336,17 @@ class WhatsAppService:
             return "manual_denylist"
         if self._settings.whatsapp_ignore_archived and conversation.archived:
             return "archived_chat"
-        return self._local_relevance_reason(data)
+        return self._local_relevance_reason(
+            data,
+            allow_unaddressed_group=conversation.tracking_enabled,
+        )
 
-    def _local_relevance_reason(self, data: OpenWAEventData) -> str | None:
+    def _local_relevance_reason(
+        self,
+        data: OpenWAEventData,
+        *,
+        allow_unaddressed_group: bool = False,
+    ) -> str | None:
         media_type = (
             (data.media.media_type or data.message_type or "").lower()
             if data.media is not None
@@ -1153,6 +1361,12 @@ class WhatsAppService:
             and data.media.size > self._settings.whatsapp_max_media_bytes
         ):
             return "media_too_large"
+        if data.is_group and not data.from_me and not allow_unaddressed_group:
+            directed = data.user_mentioned or bool(data.mentioned_ids)
+            if data.model_extra:
+                directed = directed or bool(data.model_extra.get("directedToUser"))
+            if not directed:
+                return "unaddressed_group_message"
         if data.media is not None and (
             media_type in SUPPORTED_MEDIA_TYPES
             or mime_type.startswith(("audio/", "image/", "text/"))
@@ -1168,13 +1382,11 @@ class WhatsAppService:
             return "empty_or_unsupported"
         if IRRELEVANT_TEXT.fullmatch(content):
             return "local_noise_filter"
-        if data.is_group and not data.from_me:
-            directed = data.user_mentioned or bool(data.mentioned_ids)
-            if data.model_extra:
-                directed = directed or bool(data.model_extra.get("directedToUser"))
-            if not directed:
-                return "unaddressed_group_message"
-        if not RELEVANT_TEXT.search(content) and not RELATIVE_MINUTES_TEXT.search(content):
+        if (
+            not RELEVANT_TEXT.search(content)
+            and not RELATIVE_MINUTES_TEXT.search(content)
+            and not (allow_unaddressed_group and GROUP_PLAN_TEXT.search(content))
+        ):
             return "not_locally_relevant"
         return None
 

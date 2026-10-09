@@ -2,12 +2,12 @@ import uuid
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import JSON, Float, ForeignKey, Index, String, Text
 from sqlalchemy import Enum as SqlEnum
+from sqlalchemy import Float, ForeignKey, Index, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from personal_agent.core.time import utc_now
-from personal_agent.domain.database import Base, UTCDateTime
+from personal_agent.domain.database import Base, JSONData, UTCDateTime
 from personal_agent.domain.enums import (
     ActionType,
     ApprovalStatus,
@@ -67,7 +67,7 @@ class Event(TimestampMixin, Base):
     actor_display_name: Mapped[str | None] = mapped_column(String(255))
     conversation_external_id: Mapped[str | None] = mapped_column(String(255))
     content_text: Mapped[str | None] = mapped_column(Text)
-    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSONData(), default=dict)
     dedupe_key: Mapped[str] = mapped_column(String(255))
     sensitivity: Mapped[Sensitivity] = mapped_column(enum_type(Sensitivity, "sensitivity"))
     processing_status: Mapped[ProcessingStatus] = mapped_column(
@@ -88,11 +88,11 @@ class Person(TimestampMixin, Base):
     channel: Mapped[str] = mapped_column(String(50))
     external_id: Mapped[str] = mapped_column(String(255))
     display_name: Mapped[str] = mapped_column(String(255))
-    aliases: Mapped[list[str]] = mapped_column(JSON, default=list)
-    conversation_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    aliases: Mapped[list[str]] = mapped_column(JSONData(), default=list)
+    conversation_ids: Mapped[list[str]] = mapped_column(JSONData(), default=list)
     relationship: Mapped[str | None] = mapped_column(String(100))
-    operational_facts: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    source_event_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    operational_facts: Mapped[dict[str, Any]] = mapped_column(JSONData(), default=dict)
+    source_event_ids: Mapped[list[str]] = mapped_column(JSONData(), default=list)
     confidence: Mapped[float] = mapped_column(Float, default=1.0)
     last_relevant_interaction_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, onupdate=utc_now)
@@ -151,11 +151,11 @@ class MemoryFact(TimestampMixin, Base):
     category: Mapped[str] = mapped_column(String(100))
     subject: Mapped[str] = mapped_column(String(500))
     predicate: Mapped[str] = mapped_column(String(500))
-    value_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    value_json: Mapped[dict[str, Any]] = mapped_column(JSONData())
     status: Mapped[MemoryStatus] = mapped_column(enum_type(MemoryStatus, "memory_status"))
     confidence: Mapped[float] = mapped_column(Float)
     sensitivity: Mapped[Sensitivity] = mapped_column(enum_type(Sensitivity, "memory_sensitivity"))
-    source_event_ids: Mapped[list[str]] = mapped_column(JSON)
+    source_event_ids: Mapped[list[str]] = mapped_column(JSONData())
     valid_from: Mapped[datetime | None] = mapped_column(UTCDateTime())
     expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     last_verified_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
@@ -167,7 +167,7 @@ class ApprovalRequest(TimestampMixin, Base):
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     action_type: Mapped[str] = mapped_column(String(100))
-    action_payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    action_payload: Mapped[dict[str, Any]] = mapped_column(JSONData())
     risk_class: Mapped[str] = mapped_column(String(50))
     status: Mapped[ApprovalStatus] = mapped_column(
         enum_type(ApprovalStatus, "approval_status"), default=ApprovalStatus.PENDING
@@ -206,7 +206,7 @@ class CalendarAction(TimestampMixin, Base):
     commitment_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("commitments.id"))
     approval_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("approval_requests.id"))
     operation: Mapped[str] = mapped_column(String(50))
-    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSONData())
     status: Mapped[CalendarActionStatus] = mapped_column(
         enum_type(CalendarActionStatus, "calendar_action_status")
     )
@@ -277,6 +277,8 @@ class WhatsAppConversation(TimestampMixin, Base):
     display_name: Mapped[str | None] = mapped_column(String(255))
     archived: Mapped[bool] = mapped_column(default=False)
     ignored: Mapped[bool] = mapped_column(default=False)
+    tracking_enabled: Mapped[bool] = mapped_column(default=False)
+    tracking_prompted_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     last_message_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     processing_watermark: Mapped[datetime | None] = mapped_column(UTCDateTime())
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, onupdate=utc_now)
@@ -296,7 +298,7 @@ class WhatsAppConversationBuffer(TimestampMixin, Base):
         default=WhatsAppBufferStatus.PENDING,
     )
     urgent: Mapped[bool] = mapped_column(default=False)
-    event_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    event_ids: Mapped[list[str]] = mapped_column(JSONData(), default=list)
     dedupe_key: Mapped[str] = mapped_column(String(255))
     processed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, onupdate=utc_now)
@@ -311,8 +313,8 @@ class WhatsAppHistoricalFinding(TimestampMixin, Base):
     conversation_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("whatsapp_conversations.id")
     )
-    source_event_ids: Mapped[list[str]] = mapped_column(JSON)
-    interpretation_payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    source_event_ids: Mapped[list[str]] = mapped_column(JSONData())
+    interpretation_payload: Mapped[dict[str, Any]] = mapped_column(JSONData())
     status: Mapped[HistoricalFindingStatus] = mapped_column(
         enum_type(HistoricalFindingStatus, "whatsapp_historical_finding_status"),
         default=HistoricalFindingStatus.PENDING,
@@ -333,5 +335,5 @@ class AuditLog(Base):
     source_event_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("events.id"))
     approval_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("approval_requests.id"))
     result: Mapped[str] = mapped_column(String(100))
-    redacted_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    redacted_metadata: Mapped[dict[str, Any]] = mapped_column(JSONData(), default=dict)
     timestamp: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)

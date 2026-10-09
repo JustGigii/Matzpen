@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from personal_agent.api.dependencies import get_app_settings
 from personal_agent.core.config import Settings
-from personal_agent.domain.enums import WhatsAppBufferStatus
+from personal_agent.domain.enums import WhatsAppBufferStatus, WhatsAppSessionStatus
 from personal_agent.domain.models import (
     ApprovalRequest,
     CalendarAction,
@@ -28,6 +28,10 @@ router = APIRouter(prefix="/api", tags=["status"])
 class IntegrationStatus(BaseModel):
     telegram: bool
     gemini: bool
+    groq: bool = False
+    cerebras: bool = False
+    mistral_ocr: bool = False
+    oracle: bool = False
     google_calendar: bool
     shortcut: bool
     whatsapp: bool = False
@@ -88,7 +92,11 @@ async def status_route(
     now = request.app.state.clock()
     disconnected_seconds = (
         int((now - whatsapp_state.disconnected_at).total_seconds())
-        if whatsapp_state is not None and whatsapp_state.disconnected_at is not None
+        if (
+            whatsapp_state is not None
+            and whatsapp_state.status is WhatsAppSessionStatus.DISCONNECTED
+            and whatsapp_state.disconnected_at is not None
+        )
         else None
     )
     return StatusResponse(
@@ -96,6 +104,10 @@ async def status_route(
         integrations=IntegrationStatus(
             telegram=settings.telegram_configured,
             gemini=settings.gemini_configured,
+            groq=settings.groq_configured,
+            cerebras=settings.cerebras_configured,
+            mistral_ocr=settings.mistral_configured,
+            oracle=settings.oracle_configured,
             google_calendar=settings.google_calendar_configured,
             shortcut=settings.shortcut_configured,
             whatsapp=settings.openwa_configured,

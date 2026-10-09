@@ -17,7 +17,10 @@ from personal_agent.integrations.google_calendar.base import CalendarProvider
 from personal_agent.integrations.google_calendar.client import GoogleCalendarProvider
 from personal_agent.integrations.llm.base import LLMProvider
 from personal_agent.integrations.llm.fake import FakeLLMProvider
+from personal_agent.integrations.llm.fallback import FallbackLLMProvider
 from personal_agent.integrations.llm.gemini import GeminiProvider
+from personal_agent.integrations.llm.mistral_ocr import MistralOCRProvider
+from personal_agent.integrations.llm.openai_compatible import OpenAICompatibleProvider
 from personal_agent.integrations.openwa.client import HttpOpenWAReadClient, OpenWAReadClient
 from personal_agent.integrations.telegram.base import TelegramNotifier
 from personal_agent.integrations.telegram.fake import FakeTelegramNotifier
@@ -26,6 +29,7 @@ from personal_agent.services.briefs import MorningBriefService
 from personal_agent.services.calendar import CalendarService
 from personal_agent.services.confirmations import ConfirmationService
 from personal_agent.services.control import AgentControl
+from personal_agent.services.conversation import ConversationService
 from personal_agent.services.intake import IntakeService
 from personal_agent.services.lifecycle import LifecycleService
 from personal_agent.services.media import MediaTextService
@@ -44,23 +48,76 @@ def create_app(
     clock: Callable[[], datetime] = utc_now,
 ) -> FastAPI:
     resolved_settings = settings or get_settings()
-    engine = create_engine(resolved_settings.database_url)
+    engine = create_engine(
+        resolved_settings.database_url,
+        resolved_settings.database_connect_args(),
+    )
     session_factory = create_session_factory(engine)
     control = AgentControl()
 
     resolved_llm: LLMProvider
     if llm_provider is not None:
         resolved_llm = llm_provider
-    elif resolved_settings.gemini_configured:
-        assert resolved_settings.gemini_api_key is not None
-        assert resolved_settings.gemini_model is not None
-        resolved_llm = GeminiProvider(
-            resolved_settings.gemini_api_key.get_secret_value(),
-            resolved_settings.gemini_model,
-            resolved_settings.timezone,
-        )
     else:
-        resolved_llm = FakeLLMProvider()
+        llm_providers: list[tuple[str, LLMProvider]] = []
+        if resolved_settings.gemini_configured:
+            assert resolved_settings.gemini_api_key is not None
+            assert resolved_settings.gemini_model is not None
+            llm_providers.append(
+                (
+                    "gemini",
+                    GeminiProvider(
+                        resolved_settings.gemini_api_key.get_secret_value(),
+                        resolved_settings.gemini_model,
+                        resolved_settings.timezone,
+                    ),
+                )
+            )
+        if resolved_settings.groq_configured:
+            assert resolved_settings.groq_api_key is not None
+            llm_providers.append(
+                (
+                    "groq",
+                    OpenAICompatibleProvider(
+                        resolved_settings.groq_api_key.get_secret_value(),
+                        "https://api.groq.com/openai/v1/",
+                        resolved_settings.groq_text_model,
+                        resolved_settings.timezone,
+                        vision_model=resolved_settings.groq_vision_model,
+                        audio_model=resolved_settings.groq_audio_model,
+                    ),
+                )
+            )
+        if resolved_settings.cerebras_configured:
+            assert resolved_settings.cerebras_api_key is not None
+            llm_providers.append(
+                (
+                    "cerebras",
+                    OpenAICompatibleProvider(
+                        resolved_settings.cerebras_api_key.get_secret_value(),
+                        "https://api.cerebras.ai/v1/",
+                        resolved_settings.cerebras_model,
+                        resolved_settings.timezone,
+                    ),
+                )
+            )
+        if resolved_settings.mistral_configured:
+            assert resolved_settings.mistral_api_key is not None
+            llm_providers.append(
+                (
+                    "mistral-ocr",
+                    MistralOCRProvider(
+                        resolved_settings.mistral_api_key.get_secret_value(),
+                        resolved_settings.mistral_ocr_model,
+                    ),
+                )
+            )
+        if len(llm_providers) == 1:
+            resolved_llm = llm_providers[0][1]
+        elif llm_providers:
+            resolved_llm = FallbackLLMProvider(llm_providers)
+        else:
+            resolved_llm = FakeLLMProvider()
 
     telegram_runtime: TelegramRuntime | None = None
     if notifier is not None:
@@ -114,6 +171,7 @@ def create_app(
         lifecycle=lifecycle_service,
         now=clock,
         reminder_lead_minutes=resolved_settings.default_reminder_lead_minutes,
+        timezone=resolved_settings.timezone,
         clarification_fallback_minutes=resolved_settings.clarification_fallback_minutes,
         approval_expiry_hours=resolved_settings.approval_expiry_hours,
     )
@@ -154,6 +212,14 @@ def create_app(
         default_reminder_lead_minutes=resolved_settings.default_reminder_lead_minutes,
     )
     confirmation_service = ConfirmationService(session_factory, clock, lifecycle_service)
+    conversation_service = ConversationService(
+        session_factory,
+        resolved_llm,
+        resolved_notifier,
+        resolved_calendar_provider,
+        clock,
+        resolved_settings.timezone,
+    )
     morning_brief_service = MorningBriefService(
         session_factory,
         resolved_notifier,
@@ -178,6 +244,8 @@ def create_app(
             confirmation_service,
             morning_brief_service,
             media_text_service,
+            whatsapp_service,
+            conversation_service,
         )
 
     @asynccontextmanager
@@ -199,8 +267,9 @@ def create_app(
             await whatsapp_service.stop()
             if telegram_runtime is not None:
                 await telegram_runtime.stop()
-            if isinstance(resolved_llm, GeminiProvider):
-                await resolved_llm.aclose()
+            close_llm = getattr(resolved_llm, "aclose", None)
+            if close_llm is not None:
+                await close_llm()
             if resolved_openwa_client is not None:
                 await resolved_openwa_client.aclose()
             await engine.dispose()
@@ -215,6 +284,7 @@ def create_app(
     application.state.lifecycle_service = lifecycle_service
     application.state.calendar_service = calendar_service
     application.state.confirmation_service = confirmation_service
+    application.state.conversation_service = conversation_service
     application.state.morning_brief_service = morning_brief_service
     application.state.media_text_service = media_text_service
     application.state.whatsapp_media_text_service = whatsapp_media_text_service
