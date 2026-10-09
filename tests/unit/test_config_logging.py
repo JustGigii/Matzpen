@@ -1,8 +1,10 @@
+import logging
+
 import pytest
 from pydantic import ValidationError
 
 from personal_agent.core.config import Settings
-from personal_agent.core.logging import REDACTED, redact
+from personal_agent.core.logging import REDACTED, configure_logging, redact
 
 
 def test_settings_repr_does_not_expose_webhook_secret() -> None:
@@ -16,11 +18,17 @@ def test_sensitive_values_are_recursively_redacted() -> None:
         "Authorization": "Bearer secret",
         "nested": {"api_key": "secret", "safe": "visible"},
     }
-
     assert redact(payload) == {
         "Authorization": REDACTED,
         "nested": {"api_key": REDACTED, "safe": "visible"},
     }
+
+
+def test_http_transport_info_logs_are_suppressed_to_protect_url_credentials() -> None:
+    configure_logging("INFO", json_logs=False)
+
+    assert logging.getLogger("httpx").getEffectiveLevel() == logging.WARNING
+    assert logging.getLogger("httpcore").getEffectiveLevel() == logging.WARNING
 
 
 def test_single_numeric_telegram_user_id_is_normalized() -> None:

@@ -1,3 +1,4 @@
+import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -15,6 +16,38 @@ HEBREW_ACTION_SUMMARIES = {
     "meet": "פגישה עם",
     "pay": "תשלום ל־",
 }
+
+
+def conversational_text(value: str) -> str:
+    """Render model-authored Markdown as readable Telegram plain text.
+
+    Conversation replies intentionally use no Telegram parse mode: arbitrary model text can
+    contain unmatched Markdown delimiters and make the whole send fail.  Normalize the small
+    Markdown subset models commonly emit instead, while keeping URLs and user text intact.
+    """
+    text = value.replace("\r\n", "\n").replace("\r", "\n").strip()
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", text)
+    text = re.sub(r"\*\*([^*\n]+)\*\*", r"\1", text)
+    text = re.sub(r"__([^_\n]+)__", r"\1", text)
+    text = re.sub(r"`([^`\n]+)`", r"\1", text)
+
+    rendered: list[str] = []
+    in_bullets = False
+    for raw_line in text.split("\n"):
+        bullet = re.match(r"^\s*[-*+]\s+(.+)$", raw_line)
+        if bullet is not None:
+            if rendered and rendered[-1] and not in_bullets:
+                rendered.append("")
+            rendered.append(f"• {bullet.group(1).strip()}")
+            in_bullets = True
+            continue
+        line = raw_line.strip()
+        if in_bullets and line and rendered and rendered[-1]:
+            rendered.append("")
+        rendered.append(line)
+        in_bullets = False
+
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(rendered)).strip()
 
 
 def local_datetime(value: datetime, timezone: ZoneInfo) -> str:

@@ -30,6 +30,7 @@ from personal_agent.domain.schemas import ChatRequest, ChatResponse, ChatTurn, M
 from personal_agent.integrations.google_calendar.base import CalendarProvider
 from personal_agent.integrations.llm.base import LLMProvider
 from personal_agent.integrations.telegram.base import TelegramNotifier
+from personal_agent.integrations.telegram.presentation import conversational_text
 
 MEMORY_APPROVAL_ACTION = "confirm_memory_fact"
 MEMORY_CONFIDENCE_THRESHOLD = 0.75
@@ -144,7 +145,7 @@ class ConversationService:
                 proposals.append((approval, memory))
             await session.commit()
 
-        reply_message_id = await self._notifier.send_text(response.reply)
+        reply_message_id = await self._notifier.send_text(conversational_text(response.reply))
         for approval, memory in proposals:
             approval.telegram_message_id = await self._notifier.memory_request(
                 str(approval.id),

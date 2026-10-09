@@ -33,7 +33,7 @@ async def test_chat_uses_bounded_personal_context_and_memory_requires_approval(
     llm = FakeLLMProvider(
         chat_responses=[
             ChatResponse(
-                reply="כן, אעזור לך לתכנן את השבוע.",
+                reply="**כן**, אעזור לך לתכנן את השבוע.",
                 memory_candidates=[
                     MemoryCandidate(
                         category="preference",
@@ -143,7 +143,7 @@ async def test_chat_uses_bounded_personal_context_and_memory_requires_approval(
             "תעזור לי לתכנן את השבוע",
         )
 
-        assert response.reply == "כן, אעזור לך לתכנן את השבוע."
+        assert response.reply == "**כן**, אעזור לך לתכנן את השבוע."
         request = llm.chat_requests[0]
         assert request.confirmed_memories[0].value == "Asia/Jerusalem"
         assert any("שיחת Zoom עם Shaked" in item for item in request.active_items)
@@ -153,6 +153,7 @@ async def test_chat_uses_bounded_personal_context_and_memory_requires_approval(
             for item in request.recent_notifications
         )
         assert [item.kind for item in notifier.notifications] == ["text", "memory_request"]
+        assert notifier.notifications[0].text == "כן, אעזור לך לתכנן את השבוע."
 
         async with factory() as session:
             proposal = (

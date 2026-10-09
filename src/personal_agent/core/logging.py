@@ -17,6 +17,7 @@ SENSITIVE_KEYS = frozenset(
     }
 )
 REDACTED = "[REDACTED]"
+SENSITIVE_URL_LOGGERS = ("httpx", "httpcore")
 
 
 def redact(value: Any, key: str | None = None) -> Any:
@@ -53,3 +54,7 @@ def configure_logging(level: str, *, json_logs: bool) -> None:
     else:
         handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
     logging.basicConfig(level=level.upper(), handlers=[handler], force=True)
+    # httpx includes full request URLs in INFO records. Telegram embeds the bot token in its API
+    # path, so these transport loggers must never emit request URLs in normal application logs.
+    for logger_name in SENSITIVE_URL_LOGGERS:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)

@@ -6,6 +6,7 @@ from personal_agent.domain.models import CalendarAction, Commitment, Event
 from personal_agent.integrations.telegram.presentation import (
     approval_card,
     clarification_card,
+    conversational_text,
     friendly_local_datetime,
     localized_summary,
     pending_action_card,
@@ -54,6 +55,20 @@ def test_friendly_time_avoids_iso_formatting() -> None:
     assert (
         friendly_local_datetime(reference + timedelta(days=1), reference, timezone) == "מחר ב־13:00"
     )
+
+
+def test_conversational_text_removes_model_markdown_and_spaces_hebrew_bullets() -> None:
+    raw = "**הנה מה שמצאתי:**\n- **משימה ראשונה**\n* משימה שנייה\nהמשך קצר"
+
+    assert conversational_text(raw) == (
+        "הנה מה שמצאתי:\n\n• משימה ראשונה\n• משימה שנייה\n\nהמשך קצר"
+    )
+
+
+def test_conversational_text_keeps_plain_urls_and_tolerates_unmatched_markers() -> None:
+    raw = "פרטים ב־https://example.com/a_b\n**טקסט שלא נסגר"
+
+    assert conversational_text(raw) == raw
 
 
 def test_commitment_detail_includes_due_source_status_and_calendar() -> None:
