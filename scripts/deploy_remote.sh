@@ -97,7 +97,7 @@ printf '%s\n' "$REVISION" > "$BACKUP/revision.txt"
 "$PYTHON_BIN" -m pip install --disable-pip-version-check --quiet "$RELEASE"
 
 rsync -a --exclude='.env' --exclude='src/gunicorn_conf.py' "$RELEASE/" "$DEPLOY_ROOT/"
-chown -R www:www "$DEPLOY_ROOT/src/personal_agent" "$DEPLOY_ROOT/migrations"
+chown -R root:root "$DEPLOY_ROOT/src/personal_agent" "$DEPLOY_ROOT/migrations"
 
 cd "$DEPLOY_ROOT"
 "$PYTHON_BIN" -m alembic upgrade head
@@ -138,7 +138,7 @@ if [[ "$WORKER_COUNT" != "1" ]]; then
 fi
 
 printf '%s\n' "$REVISION" > "$DEPLOY_ROOT/.deployed-revision"
-chown www:www "$DEPLOY_ROOT/.deployed-revision"
+chown root:root "$DEPLOY_ROOT/.deployed-revision"
 
 trap - ERR
 echo "Deployment $REVISION completed successfully"

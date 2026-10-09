@@ -5,8 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=www
-Group=www
+# Keep the Gunicorn master compatible with the existing root-owned pid/log files.
+# gunicorn_conf.py drops application workers to the unprivileged www account.
+User=root
+Group=root
 WorkingDirectory=/www/wwwroot/Mazpen
 ExecStart=/www/server/pyproject_env/Mazen/bin/gunicorn -c /www/wwwroot/Mazpen/src/gunicorn_conf.py personal_agent.main:app
 Restart=on-failure
