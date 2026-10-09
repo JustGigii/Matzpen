@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 # Production paths are intentionally explicit. Override only for a controlled migration.
 DEPLOY_ROOT="${MATZPEN_DEPLOY_ROOT:-/www/wwwroot/Mazpen}"
-PYTHON_BIN="${MATZPEN_PYTHON_BIN:-/www/server/pyproject_env/Mazen/bin/python3.12}"
+PYTHON_BIN="${MATZPEN_PYTHON_BIN:-/www/server/pyporject_evn/Mazen/bin/python3.12}"
 PID_FILE="${MATZPEN_PID_FILE:-$DEPLOY_ROOT/src/gunicorn.pid}"
 LIVE_URL="${MATZPEN_LIVE_URL:-http://127.0.0.1:8080/health/live}"
 READY_URL="${MATZPEN_READY_URL:-http://127.0.0.1:8080/health/ready}"
