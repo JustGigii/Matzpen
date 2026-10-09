@@ -88,4 +88,4 @@ jobs:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
         run: |
           ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
-            "sudo bash /tmp/deploy_remote.sh /tmp/matzpen-${GITHUB_SHA}.tar.gz ${GITHUB_SHA}"
+            "if [ \"\$(id -u)\" -eq 0 ]; then bash /tmp/deploy_remote.sh /tmp/matzpen-${GITHUB_SHA}.tar.gz ${GITHUB_SHA}; else sudo bash /tmp/deploy_remote.sh /tmp/matzpen-${GITHUB_SHA}.tar.gz ${GITHUB_SHA}; fi"
