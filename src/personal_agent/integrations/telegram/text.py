@@ -13,6 +13,28 @@ from personal_agent.integrations.telegram.presentation import (
 )
 
 
+def split_telegram_text(text: str, limit: int = 3900) -> list[str]:
+    """Split by UTF-16 units, preserving every character and preferring line breaks."""
+    if limit < 2:
+        raise ValueError("Telegram text limit must be at least two UTF-16 units")
+    chunks: list[str] = []
+    while text:
+        units = 0
+        end = 0
+        for character in text:
+            units += 2 if ord(character) > 0xFFFF else 1
+            if units > limit:
+                break
+            end += 1
+        if end < len(text):
+            newline = text.rfind("\n", 0, end)
+            if newline >= 0:
+                end = newline + 1
+        chunks.append(text[:end])
+        text = text[end:]
+    return chunks or [""]
+
+
 class TelegramTextNotifier:
     """Minimal initialized Telegram client for standalone scripts."""
 
@@ -47,11 +69,13 @@ class TelegramTextNotifier:
                     ]
                 ]
             )
-        message = await self._bot.send_message(
-            chat_id=self._user_id,
-            text=text,
-            reply_markup=keyboard,
-        )
+        chunks = split_telegram_text(text)
+        for index, chunk in enumerate(chunks):
+            message = await self._bot.send_message(
+                chat_id=self._user_id,
+                text=chunk,
+                reply_markup=keyboard if index == len(chunks) - 1 else None,
+            )
         return str(message.message_id)
 
     async def pending_internal_action(

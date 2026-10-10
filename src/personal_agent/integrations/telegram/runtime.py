@@ -3,7 +3,7 @@ import re
 import uuid
 from collections.abc import Collection
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from difflib import SequenceMatcher
 from typing import TYPE_CHECKING, Literal
 from zoneinfo import ZoneInfo
@@ -74,7 +74,7 @@ if TYPE_CHECKING:
     from personal_agent.services.whatsapp import WhatsAppService
 
 
-SpokenIntent = Literal["today", "calendar", "tasks", "commitments", "status", "help"]
+SpokenIntent = Literal["today", "calendar", "tasks", "commitments", "overview", "status", "help"]
 logger = logging.getLogger(__name__)
 NO_ACTION_MESSAGE = (
     'לא מצאתי בהודעה פעולה שאפשר לבצע. אפשר לנסח אותה כבקשה, למשל: "קבע פגישה עם יואל מחר ב־17:00".'
@@ -88,13 +88,14 @@ class SpokenItemResolution:
     title_hint: str | None = None
     item_kind: Literal["task", "commitment"] | None = None
     all_visible: bool = False
+    all_open: bool = False
 
 
 def classify_item_resolution(text: str) -> SpokenItemResolution | None:
     """Recognize a request about existing items; context determines the bounded scope."""
     normalized = " ".join(text.casefold().split()).strip("?!., ")
     if re.search(
-        r"\b(?:אל\s+(?:תמחק|תמחוק|תבטל|תסיר|תעיף|תוריד)|"
+        r"\b(?:אל\s+(?:תמחק|תמחוק|תבטל|תסיר|תעיף|תוריד|תסגור)|"
         r"לא\s+(?:למחוק|לבטל|להסיר|להעיף|להוריד|סיימתי|עשיתי|בוצע))\b",
         normalized,
     ):
@@ -125,6 +126,11 @@ def classify_item_resolution(text: str) -> SpokenItemResolution | None:
         normalized,
     ):
         return SpokenItemResolution(action=action, item_kind=item_kind, all_visible=True)
+    if action == "done" and re.fullmatch(
+        r"(?:סגור|סיימתי|סיימנו|השלמתי|גמרתי)(?:\s+את)?\s+(?:הכל|הכול|כולם|כולן|כל\s+(?:ה)?(?:משימות|התחייבויות))(?:\s+סיימתי)?",
+        normalized,
+    ):
+        return SpokenItemResolution(action="done", item_kind=item_kind, all_open=True)
     ordinal_words = {
         "הראשון": 1,
         "הראשונה": 1,
@@ -151,11 +157,21 @@ def classify_item_resolution(text: str) -> SpokenItemResolution | None:
     for word, ordinal in ordinal_words.items():
         if word in normalized.split():
             return SpokenItemResolution(action=action, ordinal=ordinal, item_kind=item_kind)
-    numeric = re.search(r"(?<!\d)(10|[1-9])(?!\d)", normalized)
+    action_words = (
+        r"סיימתי|סיימנו|השלמתי|גמרתי|בוצע|בוצעה|עשיתי|טופל|טופלה|סגור|"
+        r"תמחק|תמחוק|מחק|תבטל|בטל|תסיר|הסר|תעיף|עיף|תוריד|הורד|"
+        r"לא\s+רלוונטי(?:ת|ים|ות)?"
+    )
+    item_word = r"(?:ה?משימה|ה?התחייבות|ה?פריט)"
+    numeric = re.fullmatch(
+        rf"(?:(?:{action_words})\s+(?:לי\s+)?(?:את\s+)?(?:{item_word}\s+)?([1-9]\d*)"
+        rf"|(?:{item_word}\s+)?([1-9]\d*)\s+(?:{action_words}))(?:\s+בבקשה)?",
+        normalized,
+    )
     if numeric is not None:
         return SpokenItemResolution(
             action=action,
-            ordinal=int(numeric.group(1)),
+            ordinal=int(numeric.group(1) or numeric.group(2)),
             item_kind=item_kind,
         )
 
@@ -183,6 +199,21 @@ def classify_spoken_intent(text: str) -> SpokenIntent | None:
     """Recognize small, safe Hebrew questions without sending them to the extraction model."""
     normalized = " ".join(text.casefold().split()).strip("?!., ")
     phrases: tuple[tuple[SpokenIntent, tuple[str, ...]], ...] = (
+        (
+            "overview",
+            (
+                "הצג הכל",
+                "תציג הכל",
+                "תראה הכל",
+                "תראה לי הכל",
+                "הכל",
+                "מה יש לי לעשות",
+                "מה אני צריך לעשות",
+                "מה צריך לעשות",
+                "מה פתוח",
+                "מה נשאר",
+            ),
+        ),
         (
             "today",
             (
@@ -353,11 +384,15 @@ class TelegramRuntime:
                     ]
                 ]
             )
-        message = await self._application.bot.send_message(
-            chat_id=self._primary_user_id,
-            text=text,
-            reply_markup=keyboard,
-        )
+        from personal_agent.integrations.telegram.text import split_telegram_text
+
+        chunks = split_telegram_text(text)
+        for index, chunk in enumerate(chunks):
+            message = await self._application.bot.send_message(
+                chat_id=self._primary_user_id,
+                text=chunk,
+                reply_markup=keyboard if index == len(chunks) - 1 else None,
+            )
         return str(message.message_id)
 
     async def pending_internal_action(
@@ -653,12 +688,11 @@ class TelegramRuntime:
                             )
                         )
                         .order_by(Commitment.due_at.is_(None), Commitment.due_at)
-                        .limit(11)
                     )
                 ).all()
             )
             cards: list[tuple[Commitment, str]] = []
-            for commitment in commitments[:10]:
+            for commitment in commitments:
                 source_event = await session.get(Event, commitment.source_event_id)
                 calendar_action = await session.scalar(
                     select(CalendarAction).where(CalendarAction.commitment_id == commitment.id)
@@ -675,13 +709,12 @@ class TelegramRuntime:
             await self._remember_visible_items(update, "commitment", [], content)
             return
         lines = [
-            f"📋 ההתחייבויות הפתוחות ({len(cards)})"
-            + (" — מוצגות 10 הקרובות" if len(commitments) > 10 else ""),
+            f"📋 ההתחייבויות הפתוחות ({len(cards)})",
             "━━━━━━━━━━━━",
         ]
         keyboard_rows: list[list[InlineKeyboardButton]] = []
         for index, (commitment, card) in enumerate(cards, start=1):
-            lines.append(f"{index}. {' '.join(card.split())[:260]}")
+            lines.append(f"{index}. {card}")
             action_row = [
                 InlineKeyboardButton(f"✅ {index}", callback_data=f"done:{commitment.id}"),
                 InlineKeyboardButton(f"🗑️ {index}", callback_data=f"drop:{commitment.id}"),
@@ -696,10 +729,7 @@ class TelegramRuntime:
                 )
             keyboard_rows.append(action_row)
         lines.append("\nאפשר גם לכתוב: „תעיף את 2” או „סיימתי את 1”.")
-        await update.message.reply_text(
-            "\n".join(lines),
-            reply_markup=InlineKeyboardMarkup(keyboard_rows),
-        )
+        await self._reply_dashboard(update, lines, keyboard_rows)
         await self._remember_visible_items(
             update, "commitment", [item.id for item, _card in cards], "\n".join(lines)
         )
@@ -805,18 +835,17 @@ class TelegramRuntime:
                         select(Task)
                         .where(Task.status.not_in([TaskStatus.DONE, TaskStatus.CANCELLED]))
                         .order_by(Task.due_at.is_(None), Task.due_at, Task.created_at)
-                        .limit(11)
                     )
                 ).all()
             )
-        visible_tasks = tasks[:10]
+        visible_tasks = tasks
         if not visible_tasks:
             content = "☑️ המשימות שלי\n━━━━━━━━━━━━\n✨ אין משימות פתוחות."
             await update.message.reply_text(content)
             await self._remember_visible_items(update, "task", [], content)
             return
 
-        suffix = " — מוצגות 10 הקרובות" if len(tasks) > 10 else ""
+        suffix = ""
         lines = [f"☑️ המשימות הפתוחות ({len(visible_tasks)}){suffix}", "━━━━━━━━━━━━"]
         rows: list[list[InlineKeyboardButton]] = []
         for index, task in enumerate(visible_tasks, start=1):
@@ -826,8 +855,8 @@ class TelegramRuntime:
                 else "🕓 ללא מועד"
             )
             description = task.description.strip() if task.description else ""
-            details = f"\n   📎 {description[:120]}" if description else ""
-            lines.append(f"{index}. {task.title[:160]}\n   {due_text}{details}")
+            details = f"\n   📎 {description}" if description else ""
+            lines.append(f"{index}. {task.title}\n   {due_text}{details}")
             action_row = [
                 InlineKeyboardButton(f"✅ {index}", callback_data=f"done:{task.id}"),
                 InlineKeyboardButton(f"🗑️ {index}", callback_data=f"drop:{task.id}"),
@@ -839,18 +868,123 @@ class TelegramRuntime:
                 )
             rows.append(action_row)
         lines.append("\nאפשר גם לכתוב: „תעיף את 2” או „סיימתי את 1”.")
-        await update.message.reply_text(
-            "\n".join(lines),
-            reply_markup=InlineKeyboardMarkup(rows),
-        )
+        await self._reply_dashboard(update, lines, rows)
         await self._remember_visible_items(
             update, "task", [task.id for task in visible_tasks], "\n".join(lines)
+        )
+
+    async def _reply_dashboard(
+        self, update: Update, lines: list[str], rows: list[list[InlineKeyboardButton]]
+    ) -> None:
+        """Send the complete numbered list within Telegram text and keyboard limits."""
+        from personal_agent.integrations.telegram.text import split_telegram_text
+
+        message = update.message
+        if message is None:
+            return
+        for offset in range(0, max(len(rows), 1), 20):
+            page_rows = rows[offset : offset + 20]
+            page_lines = [*lines[:2], *lines[2 + offset : 2 + offset + len(page_rows)]]
+            if offset + len(page_rows) >= len(rows):
+                page_lines.extend(lines[2 + len(rows) :])
+            chunks = split_telegram_text("\n".join(page_lines))
+            for index, chunk in enumerate(chunks):
+                keyboard = (
+                    InlineKeyboardMarkup(page_rows)
+                    if index == len(chunks) - 1 and page_rows
+                    else None
+                )
+                if keyboard is None:
+                    await message.reply_text(chunk)
+                else:
+                    await message.reply_text(chunk, reply_markup=keyboard)
+
+    async def _render_open_overview(self, update: Update) -> None:
+        if not self._authorized(update):
+            await self._deny(update)
+            return
+        if update.message is None:
+            return
+        async with self._session_factory() as session:
+            tasks = list(
+                (
+                    await session.scalars(
+                        select(Task).where(
+                            Task.status.not_in([TaskStatus.DONE, TaskStatus.CANCELLED])
+                        )
+                    )
+                ).all()
+            )
+            commitments = list(
+                (
+                    await session.scalars(
+                        select(Commitment).where(
+                            Commitment.status.not_in(
+                                [CommitmentStatus.DONE, CommitmentStatus.CANCELLED]
+                            )
+                        )
+                    )
+                ).all()
+            )
+        open_items: list[Task | Commitment] = [*tasks, *commitments]
+        items = sorted(
+            open_items,
+            key=lambda item: (
+                item.due_at is None,
+                item.due_at or datetime.max.replace(tzinfo=UTC),
+                item.created_at,
+                str(item.id),
+            ),
+        )
+        lines = [f"📋 כל המשימות וההתחייבויות הפתוחות ({len(items)})", "━━━━━━━━━━━━"]
+        rows = []
+        for index, item in enumerate(items, 1):
+            title = item.title if isinstance(item, Task) else item.summary
+            kind = "משימה" if isinstance(item, Task) else "התחייבות"
+            date = (
+                item.due_at.astimezone(self._timezone).strftime("%d.%m.%Y בשעה %H:%M")
+                if item.due_at
+                else "ללא מועד — צריך לקבוע תאריך"
+            )
+            lines.append(f"{index}. {kind}: {title}\n   🕓 {date}")
+            row = [
+                InlineKeyboardButton(f"✅ {index}", callback_data=f"done:{item.id}"),
+                InlineKeyboardButton(f"🗑️ {index}", callback_data=f"drop:{item.id}"),
+                InlineKeyboardButton(f"🕓 {index}", callback_data=f"choose:{item.id}"),
+            ]
+            if getattr(self, "_calendar_service", None) is not None and item.due_at:
+                row.append(
+                    InlineKeyboardButton(f"🗓️ {index}", callback_data=f"calendarize:{item.id}")
+                )
+            rows.append(row)
+        lines.append(
+            "אפשר לכתוב מספר פריט, למשל „סיימתי את 12”." if items else "✨ אין פריטים פתוחים."
+        )
+        calendar = getattr(self, "_calendar_service", None)
+        if calendar is None:
+            lines.append("📅 היומן אינו מחובר; הרשימה כוללת את כל הפריטים השמורים במערכת.")
+        else:
+            try:
+                events = await calendar.list_upcoming(days=7)
+                lines.append("📅 אירועי היומן ב־7 הימים הקרובים:")
+                lines.extend(
+                    f"• {event.summary} — {event.start.astimezone(self._timezone):%d.%m.%Y %H:%M}"
+                    for event in events
+                )
+                if not events:
+                    lines.append("אין אירועי יומן בטווח הזה.")
+            except Exception:
+                logger.exception("telegram_calendar_overview_failed")
+                lines.append("📅 לא ניתן לקרוא את היומן כרגע. בדוק את חיבור היומן.")
+        await self._reply_dashboard(update, lines, rows)
+        await self._remember_visible_items(
+            update, "mixed", [item.id for item in items], "\n".join(lines)
         )
 
     async def _remember_visible_items(
         self,
         update: Update,
-        kind: Literal["task", "commitment"],
+        kind: Literal["task", "commitment", "mixed"],
         item_ids: list[uuid.UUID],
         content: str,
     ) -> None:
@@ -1005,6 +1139,39 @@ class TelegramRuntime:
             await query.answer("פעולה לא תקינה", show_alert=True)
             return
         handled = False
+        if action in {"bulkdone", "bulkkeep"}:
+            async with self._session_factory() as session:
+                snapshot = await session.get(Event, target_id)
+                chat = update.effective_chat
+                if (
+                    snapshot is None
+                    or snapshot.event_type != "bulk.done.request"
+                    or chat is None
+                    or snapshot.conversation_external_id != str(chat.id)
+                ):
+                    await query.answer("הבקשה כבר טופלה או אינה זמינה.", show_alert=True)
+                    return
+                item_ids = snapshot.payload_json.get("item_ids", [])
+            if action == "bulkdone" and self._reminder_service is None:
+                await query.answer("שירות המשימות אינו זמין. נסה שוב בהמשך.", show_alert=True)
+                return
+            count = 0
+            if action == "bulkdone" and self._reminder_service is not None:
+                for raw_id in item_ids:
+                    if await self._reminder_service.mark_done(uuid.UUID(raw_id)):
+                        count += 1
+            async with self._session_factory() as session:
+                snapshot = await session.get(Event, target_id)
+                if snapshot is not None:
+                    snapshot.event_type = "bulk.done.resolved"
+                    await session.commit()
+            await query.answer("בוצע")
+            await query.edit_message_text(
+                f"✅ סומנו כבוצעו {count} פריטים."
+                if action == "bulkdone"
+                else "הפריטים נשארו פתוחים."
+            )
+            return
         if action in {"watch", "unwatch"} and self._whatsapp_service is not None:
             group_label = await self._whatsapp_service.set_group_tracking(
                 target_id,
@@ -1658,6 +1825,8 @@ class TelegramRuntime:
         content = text or (message.text if message is not None else None)
         if message is None or not content:
             return False
+        if await self._handle_calendar_text(update, content):
+            return True
         item_resolution = classify_item_resolution(content)
         if item_resolution is not None:
             await self._resolve_spoken_item(update, item_resolution)
@@ -1688,6 +1857,9 @@ class TelegramRuntime:
                 lines.append("✨ אין אירועים ביומן היום.")
             await message.reply_text("\n".join(lines))
             return True
+        if intent == "overview":
+            await self._render_open_overview(update)
+            return True
         if intent == "tasks":
             await self._render_task_cards(update)
             return True
@@ -1698,6 +1870,101 @@ class TelegramRuntime:
             await message.reply_text(await self._status_text())
             return True
         await message.reply_text(self._help_text())
+        return True
+
+    async def _handle_calendar_text(self, update: Update, content: str) -> bool:
+        normalized = " ".join(content.split()).strip("?!., ")
+        match = re.fullmatch(
+            r"(?:תוסיף|הוסף|תוסיפי|הוסיפי)(?:\s+לי)?\s+(.*?)\s*(?:ליומן|ביומן)",
+            normalized,
+        )
+        if match is None:
+            return False
+        if not self._authorized(update):
+            await self._deny(update)
+            return True
+        message = update.message
+        if message is None:
+            return True
+        service = getattr(self, "_calendar_service", None)
+        if service is None:
+            await message.reply_text(
+                "היומן עדיין לא מחובר. צריך להגדיר את חיבור היומן כדי להוסיף אירועים."
+            )
+            return True
+        chat = update.effective_chat
+        if chat is None:
+            return True
+        hint = match.group(1).strip()
+        hint = re.sub(r"^(?:את\s+)?", "", hint)
+        hint = re.sub(r"\s+לי$", "", hint).strip()
+        async with self._session_factory() as session:
+            replies = list(
+                (
+                    await session.scalars(
+                        select(Event)
+                        .where(
+                            Event.source == EventSource.TELEGRAM,
+                            Event.direction == EventDirection.OUTBOUND,
+                            Event.event_type == "assistant.reply",
+                            Event.conversation_external_id == str(chat.id),
+                        )
+                        .order_by(Event.occurred_at.desc())
+                        .limit(10)
+                    )
+                ).all()
+            )
+            displayed = await self._latest_displayed_items(session, replies, [], None)
+        active = [item for item in displayed if item[2] == "active"]
+        selected = []
+        if hint in {"הכל", "הכול", "כולם", "כולן"}:
+            selected = active
+        elif hint.isdecimal():
+            ordinal = int(hint)
+            if 1 <= ordinal <= len(displayed) and displayed[ordinal - 1][2] == "active":
+                selected = [displayed[ordinal - 1]]
+        elif hint:
+            selected = [item for item in active if hint in item[1]]
+            if len(selected) != 1:
+                selected = []
+        elif len(active) == 1:
+            selected = active
+        if not selected:
+            rows = [
+                [InlineKeyboardButton(f"🗓️ {title[:40]}", callback_data=f"calendarize:{item_id}")]
+                for item_id, title, _ in active
+            ]
+            keyboard_pages = [rows[index : index + 20] for index in range(0, len(rows), 20)] or [[]]
+            for page in keyboard_pages:
+                await message.reply_text(
+                    "איזה פריט להוסיף ליומן? בחר פריט, או כתוב „תוסיף הכל ליומן”."
+                    if active
+                    else "הצג קודם את כל המשימות וההתחייבויות כדי לבחור מה להוסיף ליומן.",
+                    reply_markup=InlineKeyboardMarkup(page) if page else None,
+                )
+            return True
+        try:
+            results = await service.add_items_to_calendar(
+                [item[0] for item in selected], approval_source="explicit_telegram_text"
+            )
+        except Exception:
+            logger.exception("telegram_calendar_add_failed")
+            await message.reply_text(
+                "לא הצלחתי להוסיף ליומן. בדוק את חיבור היומן ונסה שוב; פריטים שכבר נוספו לא יוכפלו."
+            )
+            return True
+        labels = {
+            "created": "נוסף ליומן",
+            "already_exists": "כבר קיים ביומן",
+            "untimed": "צריך תאריך ושעה לפני הוספה ליומן",
+            "closed": "כבר סגור",
+            "missing": "הפריט לא נמצא",
+        }
+        from personal_agent.integrations.telegram.text import split_telegram_text
+
+        text = "\n".join(f"• {title}: {labels[results[item_id]]}" for item_id, title, _ in selected)
+        for chunk in split_telegram_text(text):
+            await message.reply_text(chunk)
         return True
 
     async def _resolve_spoken_item(self, update: Update, resolution: SpokenItemResolution) -> None:
@@ -1720,7 +1987,6 @@ class TelegramRuntime:
                             Commitment.due_at,
                             Commitment.created_at,
                         )
-                        .limit(20)
                     )
                 ).all()
             )
@@ -1730,7 +1996,6 @@ class TelegramRuntime:
                         select(Task)
                         .where(Task.status == TaskStatus.PENDING)
                         .order_by(Task.due_at.is_(None), Task.due_at, Task.created_at)
-                        .limit(20)
                     )
                 ).all()
             )
@@ -1801,6 +2066,50 @@ class TelegramRuntime:
                 session, recent_replies, reference_items, resolution.item_kind
             )
 
+        if resolution.all_open:
+            if not active_items:
+                await message.reply_text("✨ אין פריטים פתוחים לסגירה.")
+                return
+            snapshot_id = uuid.uuid4()
+            now = utc_now()
+            async with self._session_factory() as session:
+                session.add(
+                    Event(
+                        id=snapshot_id,
+                        source=EventSource.TELEGRAM,
+                        source_account="task-interface",
+                        external_id=str(snapshot_id),
+                        event_type="bulk.done.request",
+                        direction=EventDirection.OUTBOUND,
+                        occurred_at=now,
+                        received_at=now,
+                        actor_external_id="personal-agent",
+                        conversation_external_id=str(chat.id),
+                        content_text="בקשת סגירת כל הפריטים",
+                        payload_json={"item_ids": [str(item[0]) for item in active_items]},
+                        dedupe_key=f"bulk-done:{snapshot_id}",
+                        sensitivity=Sensitivity.PERSONAL,
+                        processing_status=ProcessingStatus.PROCESSED,
+                    )
+                )
+                await session.commit()
+            await message.reply_text(
+                f"לסמן כבוצעו את כל {len(active_items)} הפריטים הפתוחים?\n"
+                "משימות והתחייבויות שיתווספו אחר כך לא ייסגרו.",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "✅ כן, סיימתי הכל", callback_data=f"bulkdone:{snapshot_id}"
+                            ),
+                            InlineKeyboardButton(
+                                "✖️ השאר פתוח", callback_data=f"bulkkeep:{snapshot_id}"
+                            ),
+                        ]
+                    ]
+                ),
+            )
+            return
         if resolution.all_visible and displayed:
             cancelled = 0
             for item_id, _title, state in displayed:
@@ -1891,7 +2200,9 @@ class TelegramRuntime:
             payload = reply.payload_json or {}
             if "visible_item_ids" in payload:
                 kind = payload.get("visible_item_kind")
-                if kind not in {"task", "commitment"} or item_kind not in {None, kind}:
+                if kind not in {"task", "commitment", "mixed"} or (
+                    kind != "mixed" and item_kind not in {None, kind}
+                ):
                     return []
                 displayed = []
                 for raw_id in payload["visible_item_ids"]:
@@ -1899,13 +2210,15 @@ class TelegramRuntime:
                         item_id = uuid.UUID(raw_id)
                     except (TypeError, ValueError, AttributeError):
                         return []
-                    if kind == "task":
-                        task = await session.get(Task, item_id)
-                        if task is None:
-                            return []
+                    task = await session.get(Task, item_id) if kind in {"task", "mixed"} else None
+                    if task is not None:
+                        if item_kind == "commitment":
+                            continue
                         title = task.title
                         status = task.status.value
                     else:
+                        if item_kind == "task":
+                            continue
                         commitment = await session.get(Commitment, item_id)
                         if commitment is None:
                             return []

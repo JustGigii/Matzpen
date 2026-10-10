@@ -1,5 +1,5 @@
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta
 from typing import Literal
 from zoneinfo import ZoneInfo
@@ -27,6 +27,7 @@ from personal_agent.integrations.telegram.base import TelegramNotifier
 
 CALENDAR_CREATE_ACTION = "create_calendar_event"
 CalendarItemResult = Literal["created", "already_exists", "missing", "closed", "untimed"]
+CalendarApprovalSource = Literal["explicit_telegram_button", "explicit_telegram_text"]
 
 
 class CalendarService:
@@ -149,13 +150,34 @@ class CalendarService:
             await session.commit()
             return True
 
-    async def add_item_to_calendar(self, item_id: uuid.UUID) -> CalendarItemResult:
-        """Create a short Calendar block after an explicit Telegram button press.
+    async def add_items_to_calendar(
+        self,
+        item_ids: Iterable[uuid.UUID],
+        *,
+        approval_source: CalendarApprovalSource = "explicit_telegram_text",
+    ) -> dict[uuid.UUID, CalendarItemResult]:
+        """Add only explicitly selected items, preserving individual scheduling results."""
+        results: dict[uuid.UUID, CalendarItemResult] = {}
+        for item_id in dict.fromkeys(item_ids):
+            results[item_id] = await self.add_item_to_calendar(
+                item_id, approval_source=approval_source
+            )
+        return results
 
-        The button itself is the user's approval. A stable action key and event ID make repeated
+    async def add_item_to_calendar(
+        self,
+        item_id: uuid.UUID,
+        *,
+        approval_source: CalendarApprovalSource = "explicit_telegram_button",
+    ) -> CalendarItemResult:
+        """Create a short Calendar block after an explicit Telegram request.
+
+        The request itself is the user's approval. A stable action key and event ID make repeated
         taps idempotent, while the linked CalendarAction keeps the task/commitment status visible.
         """
 
+        if approval_source not in {"explicit_telegram_button", "explicit_telegram_text"}:
+            raise ValueError("Calendar writes require an explicit Telegram request")
         executed_at = require_aware(self._now())
         async with self._session_factory() as session:
             commitment = await session.get(Commitment, item_id)
@@ -192,7 +214,7 @@ class CalendarService:
             payload = {
                 "summary": summary,
                 "description": (
-                    "נוסף מהסוכן האישי בלחיצה מפורשת. הפריט נשאר פתוח עד לסימון 'סיימתי'."
+                    "נוסף מהסוכן האישי בבקשה מפורשת. הפריט נשאר פתוח עד לסימון 'סיימתי'."
                 ),
                 "start": due_at.isoformat(),
                 "end": (due_at + timedelta(minutes=30)).isoformat(),
@@ -233,7 +255,7 @@ class CalendarService:
                         actor="calendar_service",
                         action="add_item_to_calendar",
                         target=str(item_id),
-                        policy_decision="explicit_telegram_button",
+                        policy_decision=approval_source,
                         result="failed",
                         redacted_metadata={"error_type": type(exc).__name__},
                     )
@@ -251,7 +273,7 @@ class CalendarService:
                     actor="calendar_service",
                     action="add_item_to_calendar",
                     target=str(item_id),
-                    policy_decision="explicit_telegram_button",
+                    policy_decision=approval_source,
                     result="executed",
                 )
             )

@@ -1,11 +1,16 @@
 import uuid
 from collections.abc import AsyncIterator, Callable
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
+from types import SimpleNamespace
 from typing import cast
+from unittest.mock import AsyncMock
 
+import pytest
 from fastapi import FastAPI
 from httpx import AsyncClient
+from sqlalchemy import select
 
+from personal_agent.domain.models import AuditLog, MorningBrief
 from personal_agent.domain.schemas import CommitmentExtraction, ExtractionResult
 from personal_agent.integrations.telegram.fake import FakeTelegramNotifier
 from personal_agent.services.briefs import MorningBriefService
@@ -76,11 +81,12 @@ async def test_untimed_commitment_surfaces_daily_and_morning_trigger_deduplicate
             at=fixed_now + timedelta(days=4),
         )
         assert later.content.count("Send Daniel the file") == 1
-        assert await briefs.trigger_fallback_if_due(fixed_now + timedelta(hours=2)) is False
+        assert await briefs.trigger_fallback_if_due(fixed_now + timedelta(hours=2)) is True
+        assert await briefs.trigger_fallback_if_due(fixed_now + timedelta(hours=3)) is False
 
         notifier = cast(FakeTelegramNotifier, app.state.notifier)
         brief_notifications = [item for item in notifier.notifications if item.kind == "text"]
-        assert len(brief_notifications) == 1
+        assert len(brief_notifications) == 2
 
 
 async def test_untimed_task_surfaces_daily_until_resolved(
@@ -140,3 +146,123 @@ async def test_morning_trigger_rejects_bad_token(
             json={"source": "test"},
         )
         assert response.status_code == 401
+
+
+async def test_ten_am_questions_survive_early_brief_and_service_restart(
+    app_factory: Callable[[list[ExtractionResult] | None], FastAPI],
+    client_for_app: Callable[[FastAPI], AsyncIterator[AsyncClient]],
+    fixed_now: datetime,
+) -> None:
+    app = app_factory()
+    async for _ in client_for_app(app):
+        briefs = cast(MorningBriefService, app.state.morning_brief_service)
+        early = fixed_now.replace(hour=5)  # 08:00 Jerusalem in July.
+        assert (await briefs.trigger("waking_up", at=early)).sent
+        assert await briefs.trigger_fallback_if_due(early) is False
+        due = early + timedelta(hours=2)
+        assert await briefs.trigger_fallback_if_due(due) is True
+        restarted = MorningBriefService(
+            app.state.session_factory,
+            app.state.notifier,
+            None,
+            lambda at=due: at,
+            "Asia/Jerusalem",
+            time(10),
+        )
+        assert await restarted.trigger_fallback_if_due(due) is False
+        assert await restarted.trigger_fallback_if_due(due + timedelta(days=1)) is True
+        notifier = cast(FakeTelegramNotifier, app.state.notifier)
+        assert len(notifier.notifications) == 3
+        assert "אילו משימות או התחייבויות כבר ביצעת" in notifier.notifications[-1].text
+
+
+async def test_brief_includes_past_future_and_undated_items_with_full_dates(
+    app_factory: Callable[[list[ExtractionResult] | None], FastAPI],
+    client_for_app: Callable[[FastAPI], AsyncIterator[AsyncClient]],
+    fixed_now: datetime,
+) -> None:
+    from personal_agent.domain.models import Task
+
+    app = app_factory()
+    async for _ in client_for_app(app):
+        async with app.state.session_factory() as session:
+            session.add_all(
+                [
+                    Task(title="Past task", due_at=fixed_now - timedelta(days=1)),
+                    Task(title="Future task", due_at=fixed_now + timedelta(days=4)),
+                    Task(title="Undated task"),
+                ]
+            )
+            await session.commit()
+        brief = await app.state.morning_brief_service.trigger("test", send=False)
+        for title in ["Past task", "Future task", "Undated task"]:
+            assert brief.content.count(title) == 1
+        assert "30.07.2026 13:00" in brief.content
+        assert "04.08.2026 13:00" in brief.content
+        assert "לפריטים ללא תאריך" in brief.content
+        assert "הפריטים שבאיחור" in brief.content
+
+
+async def test_failed_ten_am_delivery_retries_without_duplicate_success(
+    app_factory: Callable[[list[ExtractionResult] | None], FastAPI],
+    client_for_app: Callable[[FastAPI], AsyncIterator[AsyncClient]],
+    fixed_now: datetime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = app_factory()
+    async for _ in client_for_app(app):
+        delivery = AsyncMock(side_effect=[RuntimeError("offline"), "sent"])
+        monkeypatch.setattr(app.state.notifier, "send_text", delivery)
+        briefs = cast(MorningBriefService, app.state.morning_brief_service)
+        with pytest.raises(RuntimeError, match="offline"):
+            await briefs.trigger_fallback_if_due(fixed_now)
+        async with app.state.session_factory() as session:
+            stored = await session.scalar(select(MorningBrief))
+            assert stored is not None and stored.sent_at is None
+            assert (
+                await session.scalar(
+                    select(AuditLog.id).where(AuditLog.action == "daily_morning_check_in")
+                )
+                is None
+            )
+        assert await briefs.trigger_fallback_if_due(fixed_now) is True
+        async with app.state.session_factory() as session:
+            stored = await session.scalar(select(MorningBrief))
+            assert stored is not None and stored.sent_at == fixed_now
+        assert await briefs.trigger_fallback_if_due(fixed_now) is False
+        assert delivery.await_count == 2
+
+
+async def test_complete_ten_am_report_is_delivered_in_telegram_chunks(
+    app_factory: Callable[[list[ExtractionResult] | None], FastAPI],
+    client_for_app: Callable[[FastAPI], AsyncIterator[AsyncClient]],
+    fixed_now: datetime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from personal_agent.domain.models import Task
+    from personal_agent.integrations.telegram.runtime import TelegramRuntime
+
+    app = app_factory()
+    async for _ in client_for_app(app):
+        async with app.state.session_factory() as session:
+            session.add_all(
+                [Task(title=f"משימה {index}: " + "פירוט ארוך " * 35) for index in range(30)]
+            )
+            await session.commit()
+        bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=1)))
+        runtime = TelegramRuntime.__new__(TelegramRuntime)
+        runtime._application = SimpleNamespace(bot=bot)
+        runtime._primary_user_id = 123
+        monkeypatch.setattr(app.state.notifier, "send_text", runtime.send_text)
+        briefs = cast(MorningBriefService, app.state.morning_brief_service)
+        assert await briefs.trigger_fallback_if_due(fixed_now) is True
+        chunks = [call.kwargs["text"] for call in bot.send_message.await_args_list]
+        assert len(chunks) > 1
+        assert all(len(chunk.encode("utf-16-le")) // 2 <= 4096 for chunk in chunks)
+        async with app.state.session_factory() as session:
+            stored = await session.scalar(select(MorningBrief))
+            assert stored is not None
+            assert "".join(chunks) == stored.content
+            assert stored.sent_at == fixed_now
+        assert "אילו משימות או התחייבויות כבר ביצעת" in chunks[-1]
+        assert await briefs.trigger_fallback_if_due(fixed_now) is False

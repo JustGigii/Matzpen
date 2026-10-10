@@ -105,6 +105,12 @@ Commands:
 
 `/today` returns a fresh daily summary without causing an automatic-delivery duplicate.
 `/tasks` and the Hebrew request `מה המשימות שלי` render only open tasks as actionable cards.
+The Hebrew requests `הצג הכל` and `מה אני צריך לעשות` show all open tasks and commitments,
+including past and future dates and items without a date. Long lists are split into messages with
+continuous numbering. `סגור הכל סיימתי` offers a confirmation button for the current set of open
+items; items created after that request are excluded. After displaying a list, `תוסיף הכל ליומן`
+adds the displayed timed items to the connected Google Calendar, without duplicate events.
+Use `תוסיף את 2 ליומן` to select one item; untimed items require a date and time first.
 Each card can mark the task done, choose a new due time, or cancel it; resolved tasks disappear
 from the next task view and their remaining reminders are closed.
 
@@ -276,11 +282,16 @@ automatic calls to one delivery per local date. A duplicate receives the already
 
 iOS Shortcuts has no generic unlock or phone-moved trigger. Use one or several Personal Automation
 approximations: Sleep → Waking Up, wake-up alarm stopped, charger disconnected, opening Telegram (or
-another morning app), plus a time-of-day backup. They may all call the endpoint safely. If none has
-created the brief by `MORNING_BRIEF_FALLBACK_TIME` (default `10:00`), the scheduler sends it once.
+another morning app), plus a time-of-day backup. They may all call the endpoint safely. At
+`MORNING_BRIEF_FALLBACK_TIME` (default `10:00` in `Asia/Jerusalem`), the scheduler sends a daily
+check-in with completion, priority, and scheduling questions, including when an earlier wake-up
+brief was already delivered. Successful check-in delivery is persisted independently of the
+wake-up brief. Keep the application running with Telegram configured; after downtime, the scheduler
+sends that day's check-in when it resumes.
 
-The brief combines today's Calendar events, timed and overdue commitments, untimed open
-commitments, due tasks, pending approvals, tight transitions/conflicts, and a priority suggestion.
+The brief combines today's Calendar events, all open commitments and tasks (past, future, and
+untimed), full local dates and times, pending approvals, tight transitions/conflicts, and a priority
+suggestion.
 
 The existing text-intake endpoint remains:
 

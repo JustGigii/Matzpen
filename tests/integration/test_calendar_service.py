@@ -15,7 +15,13 @@ from personal_agent.domain.enums import (
     ProcessingStatus,
     Sensitivity,
 )
-from personal_agent.domain.models import ApprovalRequest, CalendarAction, Commitment, Event
+from personal_agent.domain.models import (
+    ApprovalRequest,
+    AuditLog,
+    CalendarAction,
+    Commitment,
+    Event,
+)
 from personal_agent.integrations.google_calendar.fake import FakeCalendarProvider
 from personal_agent.integrations.telegram.fake import FakeTelegramNotifier
 from personal_agent.services.calendar import CalendarService
@@ -135,4 +141,62 @@ async def test_explicit_item_button_adds_timed_commitment_once(tmp_path: Path) -
         commitment = await session.get(Commitment, item_id)
         assert action is not None and action.status is CalendarActionStatus.EXECUTED
         assert commitment is not None and commitment.calendar_action_id == action.id
+    # A later explicit text request reuses the same action as the button request.
+    assert await service.add_items_to_calendar([item_id, item_id]) == {item_id: "already_exists"}
+    assert len(provider.events) == 1
+    await engine.dispose()
+
+
+async def test_text_calendar_request_reports_untimed_and_closed_items(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite+aiosqlite:///{(tmp_path / 'text-items.db').as_posix()}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    session_factory = create_session_factory(engine)
+    provider = FakeCalendarProvider()
+    now = datetime(2026, 7, 31, 10, 0, tzinfo=UTC)
+    service = CalendarService(session_factory, provider, FakeTelegramNotifier(), lambda: now)
+    async with session_factory() as session:
+        event = Event(
+            source=EventSource.TELEGRAM,
+            source_account="bot",
+            external_id="text-calendar-source",
+            event_type="message.received",
+            direction=EventDirection.INBOUND,
+            occurred_at=now,
+            received_at=now,
+            payload_json={},
+            dedupe_key="text-calendar-source",
+            sensitivity=Sensitivity.PERSONAL,
+            processing_status=ProcessingStatus.PROCESSED,
+        )
+        session.add(event)
+        await session.flush()
+        items = [
+            Commitment(
+                direction=CommitmentDirection.USER_PROMISED,
+                action_type=ActionType.CALL,
+                summary=summary,
+                due_at=due_at,
+                source_event_id=event.id,
+                status=status,
+                confidence=0.99,
+                dedupe_key=summary,
+            )
+            for summary, due_at, status in [
+                ("scheduled", now, CommitmentStatus.SCHEDULED),
+                ("untimed", None, CommitmentStatus.SCHEDULED),
+                ("closed", now, CommitmentStatus.DONE),
+            ]
+        ]
+        session.add_all(items)
+        await session.commit()
+        ids = [item.id for item in items]
+
+    results = await service.add_items_to_calendar([*ids, ids[0]])
+    assert list(results.values()) == ["created", "untimed", "closed"]
+    assert len(provider.events) == 1
+    async with session_factory() as session:
+        audit = await session.scalar(select(AuditLog))
+        assert audit is not None
+        assert audit.policy_decision == "explicit_telegram_text"
     await engine.dispose()
