@@ -1,5 +1,9 @@
 # Matzpen CI/CD
 
+לסקירה ארכיטקטונית מלאה בעברית, כולל GitHub Actions, SSH, systemd, Gunicorn,
+aaPanel/Nginx, rollback ואבחון תקלות, ראו
+[`ci-cd-aapanel-architecture-he.md`](ci-cd-aapanel-architecture-he.md).
+
 Every pull request to `main` runs formatting, lint, type checking, and the complete test suite.
 Every push to `main` runs the same checks and deploys only after all of them pass.
 

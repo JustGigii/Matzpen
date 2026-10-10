@@ -5,6 +5,7 @@ from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from difflib import SequenceMatcher
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 from zoneinfo import ZoneInfo
 
@@ -52,6 +53,10 @@ from personal_agent.domain.models import (
 )
 from personal_agent.domain.schemas import NormalizedEvent
 from personal_agent.integrations.llm.base import LLMRetryableError
+from personal_agent.integrations.telegram.document_delivery import (
+    is_ci_cd_document_request,
+    send_ci_cd_document,
+)
 from personal_agent.integrations.telegram.presentation import (
     approval_card,
     clarification_card,
@@ -100,6 +105,15 @@ def classify_item_resolution(text: str) -> SpokenItemResolution | None:
         normalized,
     ):
         return None
+    if re.fullmatch(
+        r"(?:(?:תמחק|תמחוק|מחק)\s+(?:לי\s+)?(?:את\s+)?"
+        r"(?:הכל|הכול)|"
+        r"(?:תציג|הצג|תראה|הראה)(?:\s+לי)?"
+        r"(?:\s+(?:את\s+)?(?:הכל|הכול))?\s+"
+        r"ואז\s+(?:תמחק|תמחוק|מחק)(?:\s+לי)?\s+(?:אותם|אותן|הכל|הכול))",
+        normalized,
+    ):
+        return SpokenItemResolution(action="cancel", all_open=True)
     cancel_match = re.search(
         r"\b(?:תמחק|תמחוק|מחק|למחוק|תבטל|בטל|תסיר|הסר|תעיף|עיף|תוריד|הורד|"
         r"לא\s+רלוונטי(?:ת|ים|ות)?|לא\s+צריך|עזוב|תוותר|וותר)\b",
@@ -319,6 +333,7 @@ class TelegramRuntime:
         self._application.add_handler(CommandHandler("pause", self._pause_command))
         self._application.add_handler(CommandHandler("resume", self._resume_command))
         self._application.add_handler(CommandHandler("help", self._help_command))
+        self._application.add_handler(CommandHandler("ci_cd", self._ci_cd_command))
         self._application.add_handler(CommandHandler("reschedule", self._reschedule_command))
         self._application.add_handler(CommandHandler("resolve_time", self._resolve_time_command))
         self._application.add_handler(CommandHandler("groups", self._groups_command))
@@ -620,6 +635,26 @@ class TelegramRuntime:
             return
         if update.message is not None:
             await update.message.reply_text(await self._status_text())
+
+    async def _ci_cd_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        del context
+        if not self._authorized(update):
+            await self._deny(update)
+            return
+        await self._send_ci_cd_document(update)
+
+    async def _send_ci_cd_document(self, update: Update) -> None:
+        message = update.message
+        chat = update.effective_chat
+        if message is None or chat is None:
+            return
+        try:
+            await send_ci_cd_document(self._application.bot, chat.id, Path.cwd())
+        except FileNotFoundError:
+            await message.reply_text("⚠️ מסמך ה־CI/CD לא נמצא בשרת.")
+        except TelegramError:
+            logger.exception("telegram_ci_cd_document_send_failed")
+            await message.reply_text("⚠️ לא הצלחתי לשלוח את מסמך ה־CI/CD כרגע.")
 
     async def _today_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
@@ -1811,12 +1846,14 @@ class TelegramRuntime:
     def _help_text() -> str:
         return (
             "👥 /groups — ניהול מעקב אחרי קבוצות WhatsApp\n\n"
+            "📘 /ci_cd — שליחת מדריך CI/CD ו־aaPanel\n\n"
             "💬 אפשר פשוט לכתוב לי בעברית\n━━━━━━━━━━━━\n"
             "• מה יש היום?\n"
             "• מה ביומן?\n"
             "• מה המשימות שלי?\n"
             "• מה פתוח?\n"
             "• מה המצב?\n\n"
+            "• שלח לי את מסמך ה־CI/CD\n\n"
             'אפשר גם לשלוח התחייבות חדשה, למשל: "תזכיר לי להתקשר לדניאל מחר ב־14:15".'
         )
 
@@ -1825,6 +1862,12 @@ class TelegramRuntime:
         content = text or (message.text if message is not None else None)
         if message is None or not content:
             return False
+        if is_ci_cd_document_request(content):
+            if not self._authorized(update):
+                await self._deny(update)
+                return True
+            await self._send_ci_cd_document(update)
+            return True
         if await self._handle_calendar_text(update, content):
             return True
         item_resolution = classify_item_resolution(content)
@@ -2066,6 +2109,22 @@ class TelegramRuntime:
                 session, recent_replies, reference_items, resolution.item_kind
             )
 
+        if resolution.all_open and resolution.action == "cancel":
+            if not active_items:
+                await message.reply_text("✨ אין משימות או התחייבויות פתוחות למחיקה.")
+                return
+            cancelled_titles: list[str] = []
+            for item_id, title, _state in active_items:
+                if await self._reminder_service.cancel_commitment(item_id):
+                    cancelled_titles.append(title)
+            from personal_agent.integrations.telegram.text import split_telegram_text
+
+            result_text = f"✅ בוטלו {len(cancelled_titles)} פריטים פתוחים:\n" + "\n".join(
+                f"• {title}" for title in cancelled_titles
+            )
+            for chunk in split_telegram_text(result_text):
+                await message.reply_text(chunk)
+            return
         if resolution.all_open:
             if not active_items:
                 await message.reply_text("✨ אין פריטים פתוחים לסגירה.")

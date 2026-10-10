@@ -100,7 +100,7 @@ Commands:
 
 ```text
 /start /status /today /calendar /tasks /commitments /memory
-/pause /resume /reschedule /resolve_time /groups /help
+/pause /resume /reschedule /resolve_time /groups /ci_cd /help
 ```
 
 `/today` returns a fresh daily summary without causing an automatic-delivery duplicate.
@@ -111,6 +111,10 @@ continuous numbering. `סגור הכל סיימתי` offers a confirmation butto
 items; items created after that request are excluded. After displaying a list, `תוסיף הכל ליומן`
 adds the displayed timed items to the connected Google Calendar, without duplicate events.
 Use `תוסיף את 2 ליומן` to select one item; untimed items require a date and time first.
+The exact Hebrew commands `תמחק הכל` and `תציג לי ואז תמחק אותם` immediately cancel every open
+task and commitment without another confirmation and return the complete list of cancelled titles.
+Negated, qualified, or ambiguous wording does not trigger this global operation. `/ci_cd` sends the
+tracked Hebrew CI/CD and aaPanel architecture guide as a Markdown document to the authorized user.
 Each card can mark the task done, choose a new due time, or cancel it; resolved tasks disappear
 from the next task view and their remaining reminders are closed.
 

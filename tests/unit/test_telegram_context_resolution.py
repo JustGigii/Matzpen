@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -25,6 +25,7 @@ from personal_agent.domain.enums import (
 )
 from personal_agent.domain.models import Commitment, Event, Reminder, Task
 from personal_agent.integrations.telegram.runtime import (
+    SpokenItemResolution,
     TelegramRuntime,
     classify_item_resolution,
 )
@@ -52,11 +53,12 @@ async def runtime(tmp_path: Path) -> AsyncIterator[TelegramRuntime]:
         await engine.dispose()
 
 
-def _update(text: str, chat_id: int = 123) -> SimpleNamespace:
+def _update(text: str, chat_id: int = 123, user_id: int = 123) -> SimpleNamespace:
     return SimpleNamespace(
         message=SimpleNamespace(text=text, reply_text=AsyncMock()),
         effective_chat=SimpleNamespace(id=chat_id),
-        effective_user=SimpleNamespace(id=123),
+        effective_user=SimpleNamespace(id=user_id),
+        callback_query=None,
     )
 
 
@@ -74,6 +76,44 @@ async def _tasks(runtime: TelegramRuntime, count: int = 2) -> list[uuid.UUID]:
         session.add_all(tasks)
         await session.commit()
     return [task.id for task in tasks]
+
+
+async def _commitments(runtime: TelegramRuntime, count: int = 2) -> list[uuid.UUID]:
+    now = datetime.now(UTC)
+    source_id = uuid.uuid4()
+    source = Event(
+        id=source_id,
+        source=EventSource.TELEGRAM,
+        source_account="test-bot",
+        external_id=str(uuid.uuid4()),
+        event_type="message.received",
+        direction=EventDirection.INBOUND,
+        occurred_at=now,
+        received_at=now,
+        conversation_external_id="123",
+        payload_json={},
+        dedupe_key=str(uuid.uuid4()),
+        sensitivity=Sensitivity.PERSONAL,
+        processing_status=ProcessingStatus.PROCESSED,
+    )
+    commitments = [
+        Commitment(
+            direction=CommitmentDirection.USER_PROMISED,
+            action_type=ActionType.OTHER,
+            summary=f"התחייבות פתוחה {index}",
+            source_event_id=source_id,
+            status=CommitmentStatus.SCHEDULED,
+            confidence=1.0,
+            dedupe_key=str(uuid.uuid4()),
+            created_at=now + timedelta(seconds=index),
+        )
+        for index in range(count)
+    ]
+    async with runtime._session_factory() as session:
+        session.add(source)
+        session.add_all(commitments)
+        await session.commit()
+    return [commitment.id for commitment in commitments]
 
 
 async def _legacy_reply(runtime: TelegramRuntime, content: str) -> None:
@@ -111,7 +151,17 @@ def test_bulk_cancellation_phrases_are_classified(text: str) -> None:
 
     assert resolution is not None
     assert resolution.action == "cancel"
-    assert resolution.all_visible is True
+    if text == "תמחק הכל":
+        assert resolution.all_open is True
+    else:
+        assert resolution.all_visible is True
+
+
+@pytest.mark.parametrize("text", ["תמחק הכל", "תציג לי ואז תמחק אותם"])
+def test_explicit_delete_all_phrases_target_every_open_item(text: str) -> None:
+    resolution = classify_item_resolution(text)
+
+    assert resolution == SpokenItemResolution(action="cancel", all_open=True)
 
 
 def test_qualified_bulk_request_is_not_mistaken_for_all_items() -> None:
@@ -121,7 +171,7 @@ def test_qualified_bulk_request_is_not_mistaken_for_all_items() -> None:
     assert resolution.all_visible is False
 
 
-@pytest.mark.parametrize("text", ["תמחק הכל", "תעיף את כולם", "זה לא רלוונטי"])
+@pytest.mark.parametrize("text", ["תעיף את כולם", "זה לא רלוונטי"])
 async def test_bulk_cancellation_resolves_shown_items_only(
     runtime: TelegramRuntime,
     text: str,
@@ -169,16 +219,131 @@ async def test_dashboard_persists_all_shown_items_for_a_fresh_runtime(
     assert all(statuses[item_id] == TaskStatus.CANCELLED for item_id in task_ids)
 
 
-async def test_bulk_cancellation_without_shown_context_asks_for_a_list(
+async def test_contextual_bulk_cancellation_without_shown_context_asks_for_a_list(
     runtime: TelegramRuntime,
 ) -> None:
     task_ids = await _tasks(runtime)
-    update = _update("תמחק הכל")
+    update = _update("תעיף את כולם")
 
     assert await runtime._handle_spoken_request(update) is True
 
     assert await _statuses(runtime) == dict.fromkeys(task_ids, TaskStatus.PENDING)
     assert "אין לי רשימה אחרונה מזוהה" in update.message.reply_text.await_args.args[0]
+
+
+@pytest.mark.parametrize("text", ["תמחק הכל", "תציג לי ואז תמחק אותם"])
+async def test_explicit_delete_all_cancels_all_tasks_commitments_and_reminders(
+    runtime: TelegramRuntime,
+    text: str,
+) -> None:
+    task_ids = await _tasks(runtime, 2)
+    commitment_ids = await _commitments(runtime, 2)
+    async with runtime._session_factory() as session:
+        session.add_all(
+            [
+                Reminder(
+                    task_id=task_ids[0],
+                    kind=ReminderKind.DUE,
+                    scheduled_for=datetime.now(UTC),
+                    status=ReminderStatus.PENDING,
+                    dedupe_key=f"bulk-task-{text}",
+                ),
+                Reminder(
+                    commitment_id=commitment_ids[0],
+                    kind=ReminderKind.DUE,
+                    scheduled_for=datetime.now(UTC),
+                    status=ReminderStatus.SENT,
+                    dedupe_key=f"bulk-commitment-{text}",
+                ),
+            ]
+        )
+        await session.commit()
+    update = _update(text)
+
+    assert await runtime._handle_spoken_request(update) is True
+
+    assert await _statuses(runtime) == dict.fromkeys(task_ids, TaskStatus.CANCELLED)
+    async with runtime._session_factory() as session:
+        commitments = (await session.scalars(select(Commitment))).all()
+        reminders = (await session.scalars(select(Reminder))).all()
+    assert {item.id: item.status for item in commitments} == dict.fromkeys(
+        commitment_ids, CommitmentStatus.CANCELLED
+    )
+    assert {reminder.status for reminder in reminders} == {ReminderStatus.HANDLED}
+    replies = "\n".join(call.args[0] for call in update.message.reply_text.await_args_list)
+    assert "בוטלו 4 פריטים פתוחים" in replies
+    assert all(f"להתקשר לאיש קשר {index}" in replies for index in range(2))
+    assert all(f"התחייבות פתוחה {index}" in replies for index in range(2))
+    assert all(
+        "reply_markup" not in call.kwargs for call in update.message.reply_text.await_args_list
+    )
+
+
+async def test_explicit_delete_all_reports_empty_state(runtime: TelegramRuntime) -> None:
+    update = _update("תמחק הכל")
+
+    assert await runtime._handle_spoken_request(update) is True
+
+    update.message.reply_text.assert_awaited_once_with("✨ אין משימות או התחייבויות פתוחות למחיקה.")
+
+
+async def test_explicit_delete_all_lists_every_title_across_telegram_chunks(
+    runtime: TelegramRuntime,
+) -> None:
+    task_ids = await _tasks(runtime, 220)
+    update = _update("תמחק הכל")
+
+    assert await runtime._handle_spoken_request(update) is True
+
+    replies = [call.args[0] for call in update.message.reply_text.await_args_list]
+    assert len(replies) > 1
+    assert all(len(reply.encode("utf-16-le")) // 2 <= 3900 for reply in replies)
+    combined = "".join(replies)
+    assert all(f"• להתקשר לאיש קשר {index}" in combined for index in range(220))
+    assert await _statuses(runtime) == dict.fromkeys(task_ids, TaskStatus.CANCELLED)
+
+
+async def test_spoken_ci_cd_request_sends_fixed_document(runtime: TelegramRuntime) -> None:
+    bot = SimpleNamespace()
+    runtime._application = SimpleNamespace(bot=bot)
+    update = _update("שלח לי את מסמך ה-CI/CD")
+    sender = AsyncMock(return_value="42")
+
+    with patch("personal_agent.integrations.telegram.runtime.send_ci_cd_document", sender):
+        assert await runtime._handle_spoken_request(update) is True
+
+    sender.assert_awaited_once_with(bot, 123, Path.cwd())
+    update.message.reply_text.assert_not_awaited()
+
+
+async def test_spoken_ci_cd_request_rejects_unauthorized_user(
+    runtime: TelegramRuntime,
+) -> None:
+    update = _update("שלח לי את מסמך ה-CI/CD", user_id=999)
+    sender = AsyncMock()
+
+    with patch("personal_agent.integrations.telegram.runtime.send_ci_cd_document", sender):
+        assert await runtime._handle_spoken_request(update) is True
+
+    sender.assert_not_awaited()
+    update.message.reply_text.assert_awaited_once_with("אין הרשאה להשתמש בסוכן הזה.")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "אל תמחק הכל",
+        "תמחק הכל חוץ מהשני",
+        "אולי תמחק הכל",
+        "תציג לי הכל",
+        "תמחק אותם",
+        "תמחק את כל המשימות",
+    ],
+)
+def test_non_exact_or_negated_phrases_do_not_target_every_open_item(text: str) -> None:
+    resolution = classify_item_resolution(text)
+
+    assert resolution is None or resolution.all_open is False
 
 
 async def test_ordinals_never_fall_back_to_an_older_longer_list(runtime: TelegramRuntime) -> None:
@@ -198,7 +363,7 @@ async def test_a_new_empty_list_does_not_resurrect_an_old_scope(runtime: Telegra
     await runtime._remember_visible_items(_update(""), "task", task_ids, "רשימה ישנה")
     await runtime._remember_visible_items(_update(""), "commitment", [], "אין התחייבויות")
 
-    assert await runtime._handle_spoken_request(_update("תמחק הכל")) is True
+    assert await runtime._handle_spoken_request(_update("תעיף את כולם")) is True
 
     assert await _statuses(runtime) == dict.fromkeys(task_ids, TaskStatus.PENDING)
 
@@ -207,7 +372,7 @@ async def test_list_scope_is_specific_to_the_chat(runtime: TelegramRuntime) -> N
     task_ids = await _tasks(runtime)
     await runtime._remember_visible_items(_update("", chat_id=999), "task", task_ids, "רשימה")
 
-    assert await runtime._handle_spoken_request(_update("תמחק הכל")) is True
+    assert await runtime._handle_spoken_request(_update("תעיף את כולם")) is True
 
     assert await _statuses(runtime) == dict.fromkeys(task_ids, TaskStatus.PENDING)
 
