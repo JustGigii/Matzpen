@@ -13,6 +13,7 @@ from sqlalchemy import select
 from personal_agent.domain.database import Base, create_engine, create_session_factory
 from personal_agent.domain.enums import (
     ActionType,
+    ApprovalStatus,
     CommitmentDirection,
     CommitmentStatus,
     EventDirection,
@@ -23,11 +24,12 @@ from personal_agent.domain.enums import (
     Sensitivity,
     TaskStatus,
 )
-from personal_agent.domain.models import Commitment, Event, Reminder, Task
+from personal_agent.domain.models import ApprovalRequest, Commitment, Event, Reminder, Task
 from personal_agent.integrations.telegram.runtime import (
     SpokenItemResolution,
     TelegramRuntime,
     classify_item_resolution,
+    classify_spoken_intent,
 )
 from personal_agent.services.reminders import ReminderService
 
@@ -114,6 +116,101 @@ async def _commitments(runtime: TelegramRuntime, count: int = 2) -> list[uuid.UU
         session.add_all(commitments)
         await session.commit()
     return [commitment.id for commitment in commitments]
+
+
+async def _pending_approval(
+    runtime: TelegramRuntime,
+    action_type: str,
+    summary: str,
+    **item_fields: object,
+) -> uuid.UUID:
+    approval = ApprovalRequest(
+        id=uuid.uuid4(),
+        action_type=action_type,
+        action_payload={"item": {"summary": summary, **item_fields}},
+        risk_class="internal_reversible",
+        status=ApprovalStatus.PENDING,
+        dedupe_key=f"pending-test:{uuid.uuid4()}",
+    )
+    async with runtime._session_factory() as session:
+        session.add(approval)
+        await session.commit()
+    return approval.id
+
+
+@pytest.mark.parametrize(
+    ("text", "intent"),
+    [
+        ("מה ממתין לאישור?", "pending_approvals"),
+        ("ולהבהרה", "pending_clarifications"),
+        ("מה צריך להבהיר?", "pending_clarifications"),
+    ],
+)
+def test_pending_approval_and_clarification_queries_route_deterministically(
+    text: str,
+    intent: str,
+) -> None:
+    assert classify_spoken_intent(text) == intent
+
+
+async def test_pending_approvals_are_read_from_database_and_listed_with_actions(
+    runtime: TelegramRuntime,
+) -> None:
+    approval_id = await _pending_approval(
+        runtime,
+        "confirm_extraction",
+        "לדבר עם דניאל מחר",
+    )
+    update = _update("מה ממתין לאישור?")
+
+    assert await runtime._handle_spoken_request(update) is True
+
+    update.message.reply_text.assert_awaited_once()
+    assert "לדבר עם דניאל מחר" in update.message.reply_text.await_args.args[0]
+    markup = update.message.reply_text.await_args.kwargs["reply_markup"]
+    assert markup.inline_keyboard[0][0].callback_data == f"approve:{approval_id}"
+
+
+async def test_pending_clarification_query_includes_question_and_choices(
+    runtime: TelegramRuntime,
+) -> None:
+    await _pending_approval(
+        runtime,
+        "clarify_details",
+        "לקנות כרטיס",
+        clarification_question="לאיזה אירוע לקנות כרטיס?",
+        clarification_options=["הופעה", "משחק"],
+    )
+    update = _update("ולהבהרה")
+
+    assert await runtime._handle_spoken_request(update) is True
+
+    update.message.reply_text.assert_awaited_once()
+    reply = update.message.reply_text.await_args.args[0]
+    assert "לקנות כרטיס" in reply
+    assert "לאיזה אירוע לקנות כרטיס?" in reply
+    markup = update.message.reply_text.await_args.kwargs["reply_markup"]
+    assert markup.inline_keyboard[0][0].text == "הופעה"
+
+
+async def test_pending_clarifications_exclude_resolved_approvals(runtime: TelegramRuntime) -> None:
+    await _pending_approval(runtime, "clarify_extraction", "לבחור שעה")
+    completed = ApprovalRequest(
+        action_type="clarify_details",
+        action_payload={"item": {"summary": "בקשה שכבר נפתרה"}},
+        risk_class="internal_reversible",
+        status=ApprovalStatus.EXECUTED,
+        dedupe_key="resolved-test",
+    )
+    async with runtime._session_factory() as session:
+        session.add(completed)
+        await session.commit()
+    update = _update("מה ממתין להבהרה?")
+
+    assert await runtime._handle_spoken_request(update) is True
+
+    assert "לבחור שעה" in update.message.reply_text.await_args.args[0]
+    assert "בקשה שכבר נפתרה" not in update.message.reply_text.await_args.args[0]
 
 
 async def _legacy_reply(runtime: TelegramRuntime, content: str) -> None:

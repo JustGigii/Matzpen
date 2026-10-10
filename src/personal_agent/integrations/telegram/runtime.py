@@ -79,7 +79,18 @@ if TYPE_CHECKING:
     from personal_agent.services.whatsapp import WhatsAppService
 
 
-SpokenIntent = Literal["today", "calendar", "tasks", "commitments", "overview", "status", "help"]
+SpokenIntent = Literal[
+    "today",
+    "calendar",
+    "tasks",
+    "commitments",
+    "overview",
+    "pending_approvals",
+    "pending_clarifications",
+    "status",
+    "help",
+]
+PENDING_CLARIFICATION_ACTIONS = frozenset({"clarify_extraction", "clarify_details"})
 logger = logging.getLogger(__name__)
 NO_ACTION_MESSAGE = (
     'לא מצאתי בהודעה פעולה שאפשר לבצע. אפשר לנסח אותה כבקשה, למשל: "קבע פגישה עם יואל מחר ב־17:00".'
@@ -213,6 +224,27 @@ def classify_spoken_intent(text: str) -> SpokenIntent | None:
     """Recognize small, safe Hebrew questions without sending them to the extraction model."""
     normalized = " ".join(text.casefold().split()).strip("?!., ")
     phrases: tuple[tuple[SpokenIntent, tuple[str, ...]], ...] = (
+        (
+            "pending_clarifications",
+            (
+                "ולהבהרה",
+                "מה ממתין להבהרה",
+                "מה מחכה להבהרה",
+                "מה צריך להבהיר",
+                "מה דורש הבהרה",
+                "ומה לגבי הבהרות",
+            ),
+        ),
+        (
+            "pending_approvals",
+            (
+                "מה ממתין לאישור",
+                "מה מחכה לאישור",
+                "מה צריך לאשר",
+                "מה דורש אישור",
+                "אילו בקשות ממתינות לאישור",
+            ),
+        ),
         (
             "overview",
             (
@@ -1852,6 +1884,7 @@ class TelegramRuntime:
             "• מה ביומן?\n"
             "• מה המשימות שלי?\n"
             "• מה פתוח?\n"
+            "• מה ממתין לאישור? / ולהבהרה\n"
             "• מה המצב?\n\n"
             "• שלח לי את מסמך ה־CI/CD\n\n"
             'אפשר גם לשלוח התחייבות חדשה, למשל: "תזכיר לי להתקשר לדניאל מחר ב־14:15".'
@@ -1903,6 +1936,12 @@ class TelegramRuntime:
         if intent == "overview":
             await self._render_open_overview(update)
             return True
+        if intent in {"pending_approvals", "pending_clarifications"}:
+            await self._render_pending_requests(
+                update,
+                clarifications=intent == "pending_clarifications",
+            )
+            return True
         if intent == "tasks":
             await self._render_task_cards(update)
             return True
@@ -1914,6 +1953,127 @@ class TelegramRuntime:
             return True
         await message.reply_text(self._help_text())
         return True
+
+    async def _render_pending_requests(self, update: Update, *, clarifications: bool) -> None:
+        """Read pending approvals and clarifications from their authoritative database state."""
+        message = update.message
+        if message is None:
+            return
+        async with self._session_factory() as session:
+            approvals = list(
+                (
+                    await session.scalars(
+                        select(ApprovalRequest)
+                        .where(ApprovalRequest.status == ApprovalStatus.PENDING)
+                        .order_by(ApprovalRequest.created_at)
+                    )
+                ).all()
+            )
+
+        selected = [
+            approval
+            for approval in approvals
+            if (approval.action_type in PENDING_CLARIFICATION_ACTIONS) == clarifications
+        ]
+        heading = "🤔 ממתינות להבהרה" if clarifications else "✋ ממתינות לאישור"
+        if not selected:
+            category = "להבהרה" if clarifications else "לאישור"
+            await message.reply_text(f"✨ אין כרגע בקשות {category} שממתינות.")
+            return
+
+        from personal_agent.integrations.telegram.text import split_telegram_text
+
+        for index, approval in enumerate(selected, start=1):
+            item = approval.action_payload.get("item", {})
+            summary = item.get("summary") if isinstance(item, dict) else None
+            summary = summary.strip() if isinstance(summary, str) and summary.strip() else "בקשה"
+            lines = [heading, f"{index}. {summary}"]
+            keyboard: list[list[InlineKeyboardButton]] = []
+            if approval.action_type == "confirm_memory_fact":
+                memory_id = approval.action_payload.get("memory_fact_id")
+                if isinstance(memory_id, str):
+                    async with self._session_factory() as session:
+                        memory = await session.get(MemoryFact, uuid.UUID(memory_id))
+                    if memory is not None:
+                        value = memory.value_json.get("value")
+                        if isinstance(value, str) and value.strip():
+                            lines[1] = f"{index}. הצעת זיכרון: {value.strip()}"
+                keyboard.append(
+                    [
+                        InlineKeyboardButton("🧠 שמור", callback_data=f"remember:{approval.id}"),
+                        InlineKeyboardButton("✖️ דחה", callback_data=f"forget:{approval.id}"),
+                    ]
+                )
+            elif approval.action_type == "clarify_details":
+                question, options = self._pending_detail_prompt(item)
+                lines.append(f"❓ {question}")
+                keyboard.extend(
+                    [InlineKeyboardButton(option, callback_data=f"detail:{approval.id}:{i}")]
+                    for i, option in enumerate(options)
+                )
+                keyboard.append(
+                    [
+                        InlineKeyboardButton(
+                            "✏️ אכתוב במילים שלי", callback_data=f"detailother:{approval.id}"
+                        ),
+                        InlineKeyboardButton("🗑️ בטל", callback_data=f"cancel:{approval.id}"),
+                    ]
+                )
+            elif approval.action_type == "clarify_extraction":
+                lines.append("❓ צריך לבחור שעה או לבטל את הבקשה.")
+                keyboard.extend(
+                    [
+                        InlineKeyboardButton(
+                            f"🕓 {hour:02d}:00", callback_data=f"pick:{approval.id}:{hour}"
+                        )
+                    ]
+                    for hour in (18, 19, 20)
+                )
+                keyboard.append(
+                    [
+                        InlineKeyboardButton("🕓 שעה אחרת", callback_data=f"change:{approval.id}"),
+                        InlineKeyboardButton("🗑️ בטל", callback_data=f"cancel:{approval.id}"),
+                    ]
+                )
+            elif approval.action_type == "execute_commitment_workflow":
+                keyboard.append(
+                    [
+                        InlineKeyboardButton("✅ בצע", callback_data=f"execute:{approval.id}"),
+                        InlineKeyboardButton("🗑️ בטל", callback_data=f"cancel:{approval.id}"),
+                    ]
+                )
+            elif approval.action_type == "confirm_extraction":
+                keyboard.append(
+                    [
+                        InlineKeyboardButton("✅ אשר", callback_data=f"approve:{approval.id}"),
+                        InlineKeyboardButton("🗑️ דחה", callback_data=f"reject:{approval.id}"),
+                    ]
+                )
+            for chunk_index, chunk in enumerate(split_telegram_text("\n".join(lines))):
+                markup = InlineKeyboardMarkup(keyboard) if chunk_index == 0 and keyboard else None
+                await message.reply_text(chunk, reply_markup=markup)
+
+    @staticmethod
+    def _pending_detail_prompt(item: object) -> tuple[str, tuple[str, ...]]:
+        if not isinstance(item, dict):
+            return "איזה פרט חסר?", ()
+        raw_question = item.get("clarification_question")
+        question = (
+            raw_question.strip()
+            if isinstance(raw_question, str) and raw_question.strip()
+            else "איזה פרט חסר כדי שאוכל לשמור את הבקשה נכון?"
+        )
+        raw_options = item.get("clarification_options")
+        options = (
+            tuple(
+                option.strip()[:64]
+                for option in raw_options[:4]
+                if isinstance(option, str) and option.strip()
+            )
+            if isinstance(raw_options, list)
+            else ()
+        )
+        return question, options
 
     async def _handle_calendar_text(self, update: Update, content: str) -> bool:
         normalized = " ".join(content.split()).strip("?!., ")
