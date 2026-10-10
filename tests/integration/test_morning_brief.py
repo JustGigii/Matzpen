@@ -83,6 +83,51 @@ async def test_untimed_commitment_surfaces_daily_and_morning_trigger_deduplicate
         assert len(brief_notifications) == 1
 
 
+async def test_untimed_task_surfaces_daily_until_resolved(
+    app_factory: Callable[[list[ExtractionResult] | None], FastAPI],
+    client_for_app: Callable[[FastAPI], AsyncIterator[AsyncClient]],
+    fixed_now: datetime,
+) -> None:
+    extraction = ExtractionResult(
+        language="he",
+        items=[
+            CommitmentExtraction(
+                kind="task",
+                summary="Get a moving quote",
+                action_type="other",
+                confidence=0.98,
+                evidence="get a moving quote",
+            )
+        ],
+    )
+    app = app_factory([extraction])
+    async for client in client_for_app(app):
+        intake = await shortcut_post(client, "get a moving quote", fixed_now)
+        approval_id = cast(list[str], intake["approval_ids"])[0]
+        reminders = cast(ReminderService, app.state.reminder_service)
+        assert await reminders.execute_pending_action_now(uuid.UUID(approval_id)) is True
+
+        briefs = cast(MorningBriefService, app.state.morning_brief_service)
+        first = await briefs.trigger("test_day_one", send=False, at=fixed_now)
+        later = await briefs.trigger(
+            "test_next_day",
+            send=False,
+            at=fixed_now + timedelta(days=1),
+        )
+
+        assert first.content.count("Get a moving quote") == 1
+        assert later.content.count("Get a moving quote") == 1
+
+        task_id = cast(list[str], intake["task_ids"])[0]
+        assert await reminders.mark_done(uuid.UUID(task_id)) is True
+        after_completion = await briefs.trigger(
+            "test_after_completion",
+            send=False,
+            at=fixed_now + timedelta(days=2),
+        )
+        assert "Get a moving quote" not in after_completion.content
+
+
 async def test_morning_trigger_rejects_bad_token(
     app_factory: Callable[[list[ExtractionResult] | None], FastAPI],
     client_for_app: Callable[[FastAPI], AsyncIterator[AsyncClient]],

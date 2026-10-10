@@ -87,10 +87,11 @@ class SpokenItemResolution:
     ordinal: int | None = None
     title_hint: str | None = None
     item_kind: Literal["task", "commitment"] | None = None
+    all_visible: bool = False
 
 
 def classify_item_resolution(text: str) -> SpokenItemResolution | None:
-    """Recognize a bounded request to complete or cancel one existing list item."""
+    """Recognize a request about existing items; context determines the bounded scope."""
     normalized = " ".join(text.casefold().split()).strip("?!., ")
     if re.search(
         r"\b(?:אל\s+(?:תמחק|תמחוק|תבטל|תסיר|תעיף|תוריד)|"
@@ -115,6 +116,15 @@ def classify_item_resolution(text: str) -> SpokenItemResolution | None:
         item_kind = "task"
     elif re.search(r"\bהתחייב\w*", normalized):
         item_kind = "commitment"
+    if action == "cancel" and re.fullmatch(
+        r"(?:(?:תמחק|תמחוק|מחק|תבטל|בטל|תסיר|הסר|תעיף|עיף|תוריד|הורד)\s+"
+        r"(?:לי\s+)?(?:את\s+)?(?:הכל|הכול|כולם|כולן|אותם|אותן|"
+        r"כל\s+(?:ה)?(?:משימות|התחייבויות|הפריטים))|"
+        r"(?:(?:זה|כל\s+זה|הכל|הכול|כולם|כולן|הם|הן)\s+)?"
+        r"לא\s+רלוונטי(?:ת|ים|ות)?)(?:\s+(?:לי|בבקשה))?",
+        normalized,
+    ):
+        return SpokenItemResolution(action=action, item_kind=item_kind, all_visible=True)
     ordinal_words = {
         "הראשון": 1,
         "הראשונה": 1,
@@ -160,6 +170,8 @@ def classify_item_resolution(text: str) -> SpokenItemResolution | None:
         title_hint,
     )
     title_hint = re.sub(r"\s+(?:בבקשה|לי)$", "", title_hint).strip()
+    if title_hint in {"זה", "זאת", "אותו", "אותה", "הזה", "הזאת"}:
+        title_hint = ""
     return SpokenItemResolution(
         action=action,
         title_hint=title_hint or None,
@@ -265,9 +277,6 @@ class TelegramRuntime:
         self._morning_brief_service: MorningBriefService | None = None
         self._media_text_service: MediaTextService | None = None
         self._whatsapp_service: WhatsAppService | None = None
-        self._last_visible_item_ids: dict[
-            str, tuple[Literal["task", "commitment"], list[uuid.UUID]]
-        ] = {}
         self._application = Application.builder().token(token).build()
         self._application.add_handler(CommandHandler("start", self._start_command))
         self._application.add_handler(CommandHandler("status", self._status_command))
@@ -661,14 +670,10 @@ class TelegramRuntime:
                     )
                 )
         if not cards:
-            await update.message.reply_text("📋 התחייבויות\n━━━━━━━━━━━━\nאין התחייבויות פתוחות.")
+            content = "📋 התחייבויות\n━━━━━━━━━━━━\nאין התחייבויות פתוחות."
+            await update.message.reply_text(content)
+            await self._remember_visible_items(update, "commitment", [], content)
             return
-        chat = getattr(update, "effective_chat", None)
-        if chat is not None:
-            self._last_visible_item_ids[str(chat.id)] = (
-                "commitment",
-                [item.id for item, _card in cards],
-            )
         lines = [
             f"📋 ההתחייבויות הפתוחות ({len(cards)})"
             + (" — מוצגות 10 הקרובות" if len(commitments) > 10 else ""),
@@ -694,6 +699,9 @@ class TelegramRuntime:
         await update.message.reply_text(
             "\n".join(lines),
             reply_markup=InlineKeyboardMarkup(keyboard_rows),
+        )
+        await self._remember_visible_items(
+            update, "commitment", [item.id for item, _card in cards], "\n".join(lines)
         )
 
     def _commitment_detail(
@@ -803,14 +811,10 @@ class TelegramRuntime:
             )
         visible_tasks = tasks[:10]
         if not visible_tasks:
-            await update.message.reply_text("☑️ המשימות שלי\n━━━━━━━━━━━━\n✨ אין משימות פתוחות.")
+            content = "☑️ המשימות שלי\n━━━━━━━━━━━━\n✨ אין משימות פתוחות."
+            await update.message.reply_text(content)
+            await self._remember_visible_items(update, "task", [], content)
             return
-        chat = getattr(update, "effective_chat", None)
-        if chat is not None:
-            self._last_visible_item_ids[str(chat.id)] = (
-                "task",
-                [task.id for task in visible_tasks],
-            )
 
         suffix = " — מוצגות 10 הקרובות" if len(tasks) > 10 else ""
         lines = [f"☑️ המשימות הפתוחות ({len(visible_tasks)}){suffix}", "━━━━━━━━━━━━"]
@@ -839,6 +843,46 @@ class TelegramRuntime:
             "\n".join(lines),
             reply_markup=InlineKeyboardMarkup(rows),
         )
+        await self._remember_visible_items(
+            update, "task", [task.id for task in visible_tasks], "\n".join(lines)
+        )
+
+    async def _remember_visible_items(
+        self,
+        update: Update,
+        kind: Literal["task", "commitment"],
+        item_ids: list[uuid.UUID],
+        content: str,
+    ) -> None:
+        """Keep the actual displayed scope and order available across process restarts."""
+        chat = getattr(update, "effective_chat", None)
+        if chat is None:
+            return
+        reply_id = uuid.uuid4()
+        now = utc_now()
+        async with self._session_factory() as session:
+            session.add(
+                Event(
+                    source=EventSource.TELEGRAM,
+                    source_account="task-interface",
+                    external_id=str(reply_id),
+                    event_type="assistant.reply",
+                    direction=EventDirection.OUTBOUND,
+                    occurred_at=now,
+                    received_at=now,
+                    actor_external_id="personal-agent",
+                    conversation_external_id=str(chat.id),
+                    content_text=content,
+                    payload_json={
+                        "visible_item_kind": kind,
+                        "visible_item_ids": [str(item_id) for item_id in item_ids],
+                    },
+                    dedupe_key=f"visible-items:{reply_id}",
+                    sensitivity=Sensitivity.PERSONAL,
+                    processing_status=ProcessingStatus.PROCESSED,
+                )
+            )
+            await session.commit()
 
     async def _pause_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
@@ -1731,64 +1775,47 @@ class TelegramRuntime:
                 ).all()
             )
 
-        active_items = [
-            (commitment.id, commitment.summary, "active") for commitment in commitments
-        ] + [(task.id, task.title, "active") for task in tasks]
-        reference_items = [
-            *active_items,
-            *[
-                (commitment.id, commitment.summary, commitment.status.value)
-                for commitment in closed_commitments
-            ],
-            *[(task.id, task.title, task.status.value) for task in closed_tasks],
-        ]
-        if resolution.item_kind == "task":
-            active_items = [(task.id, task.title, "active") for task in tasks]
-            reference_items = [
-                *active_items,
-                *[(task.id, task.title, task.status.value) for task in closed_tasks],
-            ]
-        elif resolution.item_kind == "commitment":
             active_items = [
-                (commitment.id, commitment.summary, "active") for commitment in commitments
+                (commitment.id, commitment.summary, "active")
+                for commitment in commitments
+                if resolution.item_kind != "task"
+            ] + [
+                (task.id, task.title, "active")
+                for task in tasks
+                if resolution.item_kind != "commitment"
             ]
             reference_items = [
                 *active_items,
                 *[
                     (commitment.id, commitment.summary, commitment.status.value)
                     for commitment in closed_commitments
+                    if resolution.item_kind != "task"
+                ],
+                *[
+                    (task.id, task.title, task.status.value)
+                    for task in closed_tasks
+                    if resolution.item_kind != "commitment"
                 ],
             ]
+            displayed = await self._latest_displayed_items(
+                session, recent_replies, reference_items, resolution.item_kind
+            )
+
+        if resolution.all_visible and displayed:
+            cancelled = 0
+            for item_id, _title, state in displayed:
+                if state == "active" and await self._reminder_service.cancel_commitment(item_id):
+                    cancelled += 1
+            await message.reply_text(
+                f"✅ בוטלו {cancelled} פריטים מהרשימה האחרונה שהצגתי."
+                if cancelled
+                else "ℹ️ כל הפריטים ברשימה האחרונה כבר טופלו."
+            )
+            return
         target: tuple[uuid.UUID, str, str] | None = None
         if resolution.ordinal is not None:
-            last_visible_kind, last_visible_ids = getattr(self, "_last_visible_item_ids", {}).get(
-                str(chat.id), (None, [])
-            )
-            kind_matches = resolution.item_kind in {None, last_visible_kind}
-            if kind_matches and resolution.ordinal <= len(last_visible_ids):
-                visible_id = last_visible_ids[resolution.ordinal - 1]
-                target = next(
-                    (item for item in reference_items if item[0] == visible_id),
-                    None,
-                )
-            for reply in recent_replies:
-                if target is not None:
-                    break
-                reply_text = self._normalize_item_reference(reply.content_text or "")
-                displayed = sorted(
-                    (
-                        position,
-                        item_id,
-                        title,
-                        state,
-                    )
-                    for item_id, title, state in reference_items
-                    if (position := reply_text.find(self._normalize_item_reference(title))) >= 0
-                )
-                if resolution.ordinal <= len(displayed):
-                    _, item_id, title, state = displayed[resolution.ordinal - 1]
-                    target = (item_id, title, state)
-                    break
+            if 1 <= resolution.ordinal <= len(displayed):
+                target = displayed[resolution.ordinal - 1]
         elif resolution.title_hint:
             normalized_hint = self._normalize_item_reference(resolution.title_hint)
             ranked = sorted(
@@ -1810,6 +1837,8 @@ class TelegramRuntime:
                 second_score = ranked[-2][0] if len(ranked) > 1 else 0.0
                 if len(ranked) == 1 or score - second_score >= 0.08:
                     target = (item_id, title, state)
+        elif not resolution.all_visible and len(displayed) == 1:
+            target = displayed[0]
 
         if target is None:
             verb = "סמן כבוצע" if resolution.action == "done" else "בטל"
@@ -1824,7 +1853,12 @@ class TelegramRuntime:
                 for item_id, title, _state in active_items[:4]
             ]
             await message.reply_text(
-                "לא ברור לי לאיזה פריט התכוונת. בחר פריט או כתוב את שמו:",
+                (
+                    "אין לי רשימה אחרונה מזוהה לביטול. הצג את המשימות או ההתחייבויות, "
+                    "ואז כתוב „תמחק הכל” כדי לבטל רק את הפריטים שיוצגו."
+                    if resolution.all_visible
+                    else "לא ברור לי לאיזה פריט התכוונת. בחר פריט או כתוב את שמו:"
+                ),
                 reply_markup=InlineKeyboardMarkup(options) if options else None,
             )
             return
@@ -1844,6 +1878,57 @@ class TelegramRuntime:
             await message.reply_text(f"✅ הפריט „{title}” {result}. שאר הרשימה לא השתנתה.")
         else:
             await message.reply_text("הפריט כבר טופל או שאינו פעיל.")
+
+    async def _latest_displayed_items(
+        self,
+        session: AsyncSession,
+        replies: list[Event],
+        reference_items: list[tuple[uuid.UUID, str, str]],
+        item_kind: Literal["task", "commitment"] | None,
+    ) -> list[tuple[uuid.UUID, str, str]]:
+        """Resolve only the newest shown list, never guess from older lists or prose."""
+        for reply in replies:
+            payload = reply.payload_json or {}
+            if "visible_item_ids" in payload:
+                kind = payload.get("visible_item_kind")
+                if kind not in {"task", "commitment"} or item_kind not in {None, kind}:
+                    return []
+                displayed = []
+                for raw_id in payload["visible_item_ids"]:
+                    try:
+                        item_id = uuid.UUID(raw_id)
+                    except (TypeError, ValueError, AttributeError):
+                        return []
+                    item = await session.get(Task if kind == "task" else Commitment, item_id)
+                    if item is None:
+                        return []
+                    title = item.title if isinstance(item, Task) else item.summary
+                    state = (
+                        item.status.value
+                        if item.status.value in {"done", "cancelled"}
+                        else "active"
+                    )
+                    displayed.append((item_id, title, state))
+                return displayed
+            lines = re.findall(
+                r"^\s*(?:[-•*]|\d+[.)])\s+(.+)$", reply.content_text or "", re.MULTILINE
+            )
+            if not lines:
+                continue
+            displayed = []
+            for line in lines:
+                normalized = self._normalize_item_reference(line)
+                matches = [
+                    item
+                    for item in reference_items
+                    if normalized == self._normalize_item_reference(item[1])
+                    or normalized.startswith(self._normalize_item_reference(item[1]) + " ")
+                ]
+                if len(matches) != 1 or matches[0] in displayed:
+                    return []
+                displayed.append(matches[0])
+            return displayed
+        return []
 
     @staticmethod
     def _normalize_item_reference(value: str) -> str:

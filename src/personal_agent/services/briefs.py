@@ -159,9 +159,8 @@ class MorningBriefService:
                     await session.scalars(
                         select(Task).where(
                             Task.status == TaskStatus.PENDING,
-                            Task.due_at.is_not(None),
-                            Task.due_at >= utc_start,
-                            Task.due_at < utc_end,
+                            Task.due_at.is_(None)
+                            | ((Task.due_at >= utc_start) & (Task.due_at < utc_end)),
                         )
                     )
                 ).all()
@@ -190,9 +189,12 @@ class MorningBriefService:
                 text = f"⏰ עד {self._local_time(commitment.due_at)} — {commitment.summary}"
             entries.append((commitment.due_at, text))
         for task in tasks:
-            entries.append(
-                (task.due_at, f"☑️ משימה עד {self._local_time(task.due_at)} — {task.title}")
+            text = (
+                f"📌 עדיין פתוחה — {task.title}"
+                if task.due_at is None
+                else f"☑️ משימה עד {self._local_time(task.due_at)} — {task.title}"
             )
+            entries.append((task.due_at, text))
         entries.sort(key=lambda entry: entry[0] or utc_end)
 
         lines = ["🌤️ בוקר טוב", "━━━━━━━━━━━━", "📅 היום:"]

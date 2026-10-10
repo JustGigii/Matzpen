@@ -46,6 +46,7 @@ from personal_agent.integrations.llm.base import (
 from personal_agent.integrations.telegram.base import TelegramNotifier
 from personal_agent.integrations.telegram.presentation import localized_summary
 from personal_agent.repositories.events import EventRepository
+from personal_agent.services.extraction_quality import filter_extraction_items
 from personal_agent.services.lifecycle import (
     CLARIFICATION_ACTION,
     COMMITMENT_WORKFLOW_ACTION,
@@ -83,6 +84,12 @@ NON_ACTION_CONTROL_PATTERN = re.compile(
     r"(?:משימ\w*|התחייב\w*|פתוח).{0,30}|"
     r"(?:משימ\w*\s*\d*\s*)?(?:בוצע|בוצעה|סיימתי|בטל|ביטול|מחק)"
     r"(?:\s+משימ\w*\s*\d*)?)\s*[?!.]*\s*$",
+    re.IGNORECASE,
+)
+ANAPHORIC_REMINDER_PATTERN = re.compile(
+    r"(?:תזכיר(?:י)?|להזכיר|תזכורת)\b.{0,100}"  # noqa: RUF001
+    r"(?:(?:לעשות|לבצע|לקבוע|אעשה|יעשה|אבצע|אקבע)\s+(?:את\s+)?(?:זה|זאת)|"
+    r"(?:על|לגבי)\s+(?:זה|זאת))\s*[?!.]*\s*$",
     re.IGNORECASE,
 )
 GENERIC_CLARIFICATION_OPTION_PATTERN = re.compile(
@@ -184,6 +191,13 @@ class IntakeService:
                 superseded_message_ids: list[str] = []
                 force_confirmation = bool(event.payload_json.get("force_confirmation", False))
                 items = self._ensure_explicit_link_commitment(extraction.items, event)
+                items = filter_extraction_items(
+                    event.content_text or "",
+                    items,
+                    source=event.source,
+                    event_direction=event.direction,
+                    conversation_type=self._conversation_type(event),
+                )
                 for index, item in enumerate(items):
                     item = self._enrich_item(item, event)
                     item_dedupe_key = f"event:{event.id}:item:{index}"
@@ -626,6 +640,7 @@ class IntakeService:
             or CONVERSATIONAL_FOLLOWUP_PATTERN.search(event.content_text) is not None
             or IntakeService._looks_like_rewrite_followup(event.content_text)
             or NON_ACTION_CONTROL_PATTERN.search(event.content_text) is not None
+            or ANAPHORIC_REMINDER_PATTERN.search(event.content_text) is not None
         )
 
     @staticmethod
