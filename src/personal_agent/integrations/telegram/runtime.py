@@ -1899,15 +1899,19 @@ class TelegramRuntime:
                         item_id = uuid.UUID(raw_id)
                     except (TypeError, ValueError, AttributeError):
                         return []
-                    item = await session.get(Task if kind == "task" else Commitment, item_id)
-                    if item is None:
-                        return []
-                    title = item.title if isinstance(item, Task) else item.summary
-                    state = (
-                        item.status.value
-                        if item.status.value in {"done", "cancelled"}
-                        else "active"
-                    )
+                    if kind == "task":
+                        task = await session.get(Task, item_id)
+                        if task is None:
+                            return []
+                        title = task.title
+                        status = task.status.value
+                    else:
+                        commitment = await session.get(Commitment, item_id)
+                        if commitment is None:
+                            return []
+                        title = commitment.summary
+                        status = commitment.status.value
+                    state = status if status in {"done", "cancelled"} else "active"
                     displayed.append((item_id, title, state))
                 return displayed
             lines = re.findall(
