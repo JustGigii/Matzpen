@@ -71,7 +71,13 @@ mkdir -p "$BACKUP"
 chmod 700 "$BACKUP"
 tar -xzf "$ARCHIVE" -C "$STAGING"
 
-for required in pyproject.toml alembic.ini src/personal_agent/main.py scripts/deploy_remote.sh; do
+for required in \
+  pyproject.toml \
+  alembic.ini \
+  src/personal_agent/main.py \
+  scripts/deploy_remote.sh \
+  scripts/notify_deploy_telegram.py \
+  docs/ci-cd-aapanel-architecture-he.md; do
   if [[ ! -f "$RELEASE/$required" ]]; then
     echo "Release is missing $required" >&2
     false
@@ -142,3 +148,9 @@ chown root:root "$DEPLOY_ROOT/.deployed-revision"
 
 trap - ERR
 echo "Deployment $REVISION completed successfully"
+
+# Notify only after the release and all health checks succeeded. Telegram delivery is
+# best-effort: a temporary messaging failure must not roll back a healthy deployment.
+if ! "$PYTHON_BIN" "$DEPLOY_ROOT/scripts/notify_deploy_telegram.py" "$REVISION"; then
+  echo "Warning: Telegram deployment notification was not delivered" >&2
+fi
