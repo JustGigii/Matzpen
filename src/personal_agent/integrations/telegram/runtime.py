@@ -66,7 +66,11 @@ from personal_agent.integrations.telegram.presentation import (
     timetable_card,
 )
 from personal_agent.services.control import AgentControl
-from personal_agent.services.media import MediaAttachment, MediaValidationError
+from personal_agent.services.media import (
+    GEMINI_MEDIA_MIME_TYPES,
+    MediaAttachment,
+    MediaValidationError,
+)
 
 if TYPE_CHECKING:
     from personal_agent.services.briefs import MorningBriefService
@@ -95,6 +99,7 @@ logger = logging.getLogger(__name__)
 NO_ACTION_MESSAGE = (
     'לא מצאתי בהודעה פעולה שאפשר לבצע. אפשר לנסח אותה כבקשה, למשל: "קבע פגישה עם יואל מחר ב־17:00".'
 )
+LLM_PROGRESS_MESSAGE = "⏳ שנייה, אני בודק את זה ומיד חוזר אליך."
 
 
 @dataclass(frozen=True)
@@ -643,6 +648,13 @@ class TelegramRuntime:
     def _authorized(self, update: Update) -> bool:
         user = update.effective_user
         return is_authorized_user(user.id if user is not None else None, self._allowed_user_ids)
+
+    @staticmethod
+    async def _send_llm_progress(message: Message) -> None:
+        try:
+            await message.reply_text(LLM_PROGRESS_MESSAGE)
+        except TelegramError:
+            logger.warning("telegram_llm_progress_message_failed")
 
     async def _deny(self, update: Update) -> None:
         if update.callback_query is not None:
@@ -1284,6 +1296,8 @@ class TelegramRuntime:
                 await query.answer("האפשרות כבר אינה זמינה", show_alert=True)
                 return
             try:
+                if isinstance(query.message, Message):
+                    await self._send_llm_progress(query.message)
                 resolution = await self._intake_service.refine_approval(target_id, answer)
             except LLMRetryableError as exc:
                 await query.answer(retryable_llm_message(exc), show_alert=True)
@@ -1643,6 +1657,7 @@ class TelegramRuntime:
 
         if kind == "detail" and self._intake_service is not None:
             try:
+                await self._send_llm_progress(message)
                 resolution = await self._intake_service.refine_approval(target_id, message.text)
             except LLMRetryableError as exc:
                 await message.reply_text(retryable_llm_message(exc))
@@ -2538,6 +2553,9 @@ class TelegramRuntime:
             return
 
         filename = message.document.file_name if message.document is not None else None
+        progress_sent = mime_type in GEMINI_MEDIA_MIME_TYPES
+        if progress_sent:
+            await self._send_llm_progress(message)
         try:
             telegram_file = await context.bot.get_file(file_id)
             content = bytes(await telegram_file.download_as_bytearray())
@@ -2578,6 +2596,8 @@ class TelegramRuntime:
         caption = message.caption.strip() if message.caption else ""
         source_text = f"{caption}\n{extracted_text}".strip()
         try:
+            if not progress_sent:
+                await self._send_llm_progress(message)
             result = await self._intake_service.ingest(
                 NormalizedEvent(
                     source=EventSource.TELEGRAM,
@@ -2642,6 +2662,7 @@ class TelegramRuntime:
             await message.reply_text("שירות הקליטה עדיין לא מוכן.")
             return
         try:
+            await self._send_llm_progress(message)
             result = await self._intake_service.ingest(
                 NormalizedEvent(
                     source=EventSource.TELEGRAM,

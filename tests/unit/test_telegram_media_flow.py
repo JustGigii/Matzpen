@@ -24,7 +24,7 @@ class _SessionContext:
 
 
 @pytest.mark.asyncio
-async def test_media_text_enters_intake_without_intermediate_messages() -> None:
+async def test_media_text_shows_progress_before_entering_intake() -> None:
     runtime = object.__new__(TelegramRuntime)
     runtime._allowed_user_ids = frozenset({123})
     runtime._control = SimpleNamespace(paused=False)
@@ -70,7 +70,8 @@ async def test_media_text_enters_intake_without_intermediate_messages() -> None:
 
     await runtime._ingest_media(update, context)
 
-    message.reply_text.assert_not_awaited()
+    message.reply_text.assert_awaited_once()
+    assert "שנייה, אני בודק" in message.reply_text.await_args.args[0]
     runtime._intake_service.ingest.assert_awaited_once()
     candidate = runtime._intake_service.ingest.await_args.args[0]
     assert candidate.content_text == "קבע פגישה עם יואל מחר ב־17:00"
@@ -78,7 +79,7 @@ async def test_media_text_enters_intake_without_intermediate_messages() -> None:
 
 
 @pytest.mark.asyncio
-async def test_media_without_an_action_gets_one_helpful_reply() -> None:
+async def test_media_without_an_action_gets_progress_then_helpful_reply() -> None:
     runtime = object.__new__(TelegramRuntime)
     runtime._allowed_user_ids = frozenset({123})
     runtime._control = SimpleNamespace(paused=False)
@@ -117,12 +118,13 @@ async def test_media_without_an_action_gets_one_helpful_reply() -> None:
 
     await runtime._ingest_media(update, context)
 
-    message.reply_text.assert_awaited_once()
-    assert "לא מצאתי" in message.reply_text.await_args.args[0]
+    assert message.reply_text.await_count == 2
+    assert "שנייה, אני בודק" in message.reply_text.await_args_list[0].args[0]
+    assert "לא מצאתי" in message.reply_text.await_args_list[1].args[0]
 
 
 @pytest.mark.asyncio
-async def test_text_enters_intake_without_a_technical_summary() -> None:
+async def test_text_shows_progress_before_entering_intake() -> None:
     runtime = object.__new__(TelegramRuntime)
     runtime._allowed_user_ids = frozenset({123})
     runtime._control = SimpleNamespace(paused=False)
@@ -152,7 +154,8 @@ async def test_text_enters_intake_without_a_technical_summary() -> None:
 
     await runtime._ingest_text(update, SimpleNamespace())
 
-    message.reply_text.assert_not_awaited()
+    message.reply_text.assert_awaited_once()
+    assert "שנייה, אני בודק" in message.reply_text.await_args.args[0]
     runtime._intake_service.ingest.assert_awaited_once()
 
 
@@ -183,8 +186,9 @@ async def test_text_reports_gemini_quota_in_telegram() -> None:
 
     await runtime._ingest_text(update, SimpleNamespace())
 
-    message.reply_text.assert_awaited_once()
-    reply = message.reply_text.await_args.args[0]
+    assert message.reply_text.await_count == 2
+    assert "שנייה, אני בודק" in message.reply_text.await_args_list[0].args[0]
+    reply = message.reply_text.await_args_list[1].args[0]
     assert "מכסת שירות ה-AI נוצלה" in reply
     assert "40 שניות" in reply
     assert "מכסת החינם היומית" in reply
@@ -216,7 +220,8 @@ async def test_text_reports_temporary_gemini_unavailability_without_raw_error() 
 
     await runtime._ingest_text(update, SimpleNamespace())
 
-    reply = message.reply_text.await_args.args[0]
+    assert "שנייה, אני בודק" in message.reply_text.await_args_list[0].args[0]
+    reply = message.reply_text.await_args_list[1].args[0]
     assert "שירות ה-AI עמוס זמנית" in reply
     assert "30 שניות" in reply
     assert "ServerError" not in reply
