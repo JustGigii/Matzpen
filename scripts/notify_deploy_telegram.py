@@ -7,6 +7,7 @@ import re
 import sys
 from pathlib import Path
 
+import httpx
 from telegram import Bot
 
 from personal_agent.core.config import get_settings
@@ -20,16 +21,28 @@ MARKER_ROOT = Path("/www/backup/Mazpen")
 
 
 def deployment_caption(revision: str) -> str:
-    """Build the concise answer delivered with the architecture guide."""
+    """Build a release notification without reusing notes from an older change."""
     return (
-        "✅ סיימתי והעליתי את השינוי לייצור.\n\n"
-        "הפקודות „תמחק הכל” ו„תציג לי ואז תמחק אותם” מוחקות עכשיו מיד את כל "  # noqa: RUF001
-        "המשימות וההתחייבויות הפתוחות, ומציגות מה נמחק.\n\n"
-        "אין צורך במודל חזק יותר: זו הייתה בעיית ניתוב ולוגיקה, ולכן הפקודות האלה "
-        "מטופלות באופן ישיר ועקבי לפני פנייה למודל.\n\n"
+        "✅ הפריסה לייצור הסתיימה ובדיקות השירות עברו.\n"
         "מצורף מדריך ה־CI/CD והחיבור ל־aaPanel.\n"
         f"גרסה: {revision[:7]}"
     )
+
+
+def whatsapp_status_line() -> str:
+    """Report observed integration state, without treating API health as WhatsApp health."""
+    try:
+        with httpx.Client(trust_env=False, timeout=5) as client:
+            response = client.get("http://127.0.0.1:8080/api/status")
+            response.raise_for_status()
+        status = response.json()["whatsapp"]
+        if not status["configured"]:
+            return "WhatsApp: לא מוגדר בשרת."
+        if status["reachable"] and status["session_state"] == "connected":
+            return "WhatsApp: החיבור פעיל לפי בדיקת השרת."
+        return f"WhatsApp: דרושה בדיקה; מצב חיבור: {status['session_state']}."
+    except (httpx.HTTPError, ValueError, KeyError, TypeError):
+        return "WhatsApp: מצב החיבור לא זמין לבדיקה."
 
 
 def _create_marker(marker: Path, revision: str) -> None:
@@ -64,7 +77,7 @@ async def notify(revision: str) -> None:
             chat_id=settings.telegram_allowed_user_ids[0],
             document=document,
             filename=CI_CD_DOCUMENT_FILENAME,
-            caption=deployment_caption(revision),
+            caption=f"{deployment_caption(revision)}\n{whatsapp_status_line()}",
         )
 
     try:

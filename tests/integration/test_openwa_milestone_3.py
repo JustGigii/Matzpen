@@ -454,6 +454,43 @@ async def test_inbound_batch_resets_timer_recovers_after_restart_and_stays_propo
         assert "זה חשוב לפגישה מחר" in llm.requests[0].content_text
 
 
+async def test_private_request_without_keyword_reaches_extraction(tmp_path: Path) -> None:
+    start = datetime(2026, 8, 1, 9, 0, tzinfo=UTC)
+    request = "תוכל להביא לי את המסמכים ביום ראשון?"
+    app = build_app(
+        tmp_path / "natural-private-request.db",
+        MutableClock(start),
+        results=[
+            ExtractionResult(
+                language="he",
+                items=[
+                    CommitmentExtraction(
+                        kind="task",
+                        summary="להביא את המסמכים ביום ראשון",
+                        action_type="other",
+                        direction="user_promised",
+                        confidence=0.97,
+                        evidence=request,
+                    )
+                ],
+            )
+        ],
+    )
+
+    async with app_client(app) as client:
+        response = await signed_post(client, make_payload("natural-request", request))
+        assert response.json()["buffered"] is True
+        whatsapp = cast(WhatsAppService, app.state.whatsapp_service)
+        assert await whatsapp.flush_due_buffers(start + timedelta(minutes=3)) == 1
+
+    llm = cast(FakeLLMProvider, app.state.llm_provider)
+    assert len(llm.requests) == 1
+    assert request in llm.requests[0].content_text
+    session_factory = cast(async_sessionmaker[AsyncSession], app.state.session_factory)
+    async with session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(ApprovalRequest)) == 1
+
+
 async def test_urgent_outgoing_bypasses_buffer_without_duplicate_and_normalizes_direction(
     tmp_path: Path,
 ) -> None:

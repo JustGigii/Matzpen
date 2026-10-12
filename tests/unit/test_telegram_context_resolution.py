@@ -268,6 +268,51 @@ def test_qualified_bulk_request_is_not_mistaken_for_all_items() -> None:
     assert resolution.all_visible is False
 
 
+def test_older_months_without_count_asks_for_a_bounded_scope() -> None:
+    resolution = classify_item_resolution("בטל לי את מה שהיה בחודשים האחרונים לא כלל החודש האחרון")
+
+    assert resolution == SpokenItemResolution(action="cancel", needs_month_count=True)
+
+
+async def test_older_months_clarification_does_not_offer_unrelated_items(
+    runtime: TelegramRuntime,
+) -> None:
+    task_ids = await _tasks(runtime)
+    update = _update("בטל לי את מה שהיה בחודשים האחרונים לא כלל החודש האחרון")
+
+    assert await runtime._handle_spoken_request(update) is True
+
+    assert await _statuses(runtime) == dict.fromkeys(task_ids, TaskStatus.PENDING)
+    reply = update.message.reply_text.await_args
+    assert "כמה חודשים אחורה" in reply.args[0]
+    assert "reply_markup" not in reply.kwargs
+
+
+async def test_counted_older_months_cancels_only_matching_dates(runtime: TelegramRuntime) -> None:
+    task_ids = await _tasks(runtime, 4)
+    async with runtime._session_factory() as session:
+        for task_id, month in zip(task_ids, (7, 8, 9, 10), strict=True):
+            task = await session.get(Task, task_id)
+            assert task is not None
+            task.due_at = datetime(2026, month, 12, 9, tzinfo=UTC)
+        await session.commit()
+    update = _update("בטל 3 חודשים אחרונים חוץ מהחודש האחרון")
+
+    with patch(
+        "personal_agent.integrations.telegram.runtime.utc_now",
+        return_value=datetime(2026, 10, 12, 8, tzinfo=UTC),
+    ):
+        assert await runtime._handle_spoken_request(update) is True
+
+    assert await _statuses(runtime) == {
+        task_ids[0]: TaskStatus.CANCELLED,
+        task_ids[1]: TaskStatus.CANCELLED,
+        task_ids[2]: TaskStatus.PENDING,
+        task_ids[3]: TaskStatus.PENDING,
+    }
+    assert "בוטלו 2 פריטים" in update.message.reply_text.await_args.args[0]
+
+
 @pytest.mark.parametrize("text", ["תעיף את כולם", "זה לא רלוונטי"])
 async def test_bulk_cancellation_resolves_shown_items_only(
     runtime: TelegramRuntime,

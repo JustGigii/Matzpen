@@ -110,6 +110,8 @@ class SpokenItemResolution:
     item_kind: Literal["task", "commitment"] | None = None
     all_visible: bool = False
     all_open: bool = False
+    older_months: int | None = None
+    needs_month_count: bool = False
 
 
 def classify_item_resolution(text: str) -> SpokenItemResolution | None:
@@ -156,6 +158,21 @@ def classify_item_resolution(text: str) -> SpokenItemResolution | None:
         normalized,
     ):
         return SpokenItemResolution(action=action, item_kind=item_kind, all_visible=True)
+    if (
+        action == "cancel"
+        and re.search(r"\b(?:ב)?חודשים?\s+(?:ה)?אחרונים\b", normalized)
+        and re.search(
+            r"(?:לא\s+(?:כולל|כלל)|חוץ\s+מ|מלבד)\s*(?:את\s+)?החודש\s+האחרון",
+            normalized,
+        )
+    ):
+        count_match = re.search(r"\b([2-9]|1[0-2])\s+חודשים?\b", normalized)
+        return SpokenItemResolution(
+            action="cancel",
+            item_kind=item_kind,
+            older_months=int(count_match.group(1)) if count_match else None,
+            needs_month_count=count_match is None,
+        )
     if action == "done" and re.fullmatch(
         r"(?:סגור|סיימתי|סיימנו|השלמתי|גמרתי)(?:\s+את)?\s+(?:הכל|הכול|כולם|כולן|כל\s+(?:ה)?(?:משימות|התחייבויות))(?:\s+סיימתי)?",
         normalized,
@@ -2190,6 +2207,12 @@ class TelegramRuntime:
         chat = update.effective_chat
         if message is None or chat is None or self._reminder_service is None:
             return
+        if resolution.needs_month_count:
+            await message.reply_text(
+                "כדי לבטל רק את החודשים שהתכוונת אליהם, כמה חודשים אחורה לבדוק? "
+                "החודש האחרון יישאר. למשל: ״בטל 3 חודשים אחרונים חוץ מהחודש האחרון״."
+            )
+            return
         async with self._session_factory() as session:
             commitments = list(
                 (
@@ -2283,6 +2306,46 @@ class TelegramRuntime:
             displayed = await self._latest_displayed_items(
                 session, recent_replies, reference_items, resolution.item_kind
             )
+
+        if resolution.older_months is not None:
+            local_now = utc_now().astimezone(self._timezone)
+            first_month = local_now.year * 12 + local_now.month - resolution.older_months
+            last_month = local_now.year * 12 + local_now.month - 2
+            scoped_items: list[tuple[uuid.UUID, str]] = []
+            dated_items: list[Commitment | Task] = [*commitments, *tasks]
+            for item in dated_items:
+                if resolution.item_kind == "task" and not isinstance(item, Task):
+                    continue
+                if resolution.item_kind == "commitment" and not isinstance(item, Commitment):
+                    continue
+                item_date = item.due_at or item.created_at
+                if item_date.tzinfo is None:
+                    item_date = item_date.replace(tzinfo=UTC)
+                local_date = item_date.astimezone(self._timezone)
+                if first_month <= local_date.year * 12 + local_date.month <= last_month:
+                    scoped_items.append(
+                        (item.id, item.summary if isinstance(item, Commitment) else item.title)
+                    )
+            if not scoped_items:
+                await message.reply_text(
+                    "לא מצאתי פריטים פתוחים בחודשים האלה. החודש האחרון לא שונה."
+                )
+                return
+            month_cancelled_titles = [
+                title
+                for item_id, title in scoped_items
+                if await self._reminder_service.cancel_commitment(item_id)
+            ]
+            from personal_agent.integrations.telegram.text import split_telegram_text
+
+            reply = (
+                f"✅ בוטלו {len(month_cancelled_titles)} פריטים מהחודשים שביקשת. "
+                "החודש האחרון לא שונה:\n"
+            )
+            reply += "\n".join(f"• {title}" for title in month_cancelled_titles)
+            for chunk in split_telegram_text(reply):
+                await message.reply_text(chunk)
+            return
 
         if resolution.all_open and resolution.action == "cancel":
             if not active_items:

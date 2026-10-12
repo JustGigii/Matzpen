@@ -1382,6 +1382,10 @@ class WhatsAppService:
             return "empty_or_unsupported"
         if IRRELEVANT_TEXT.fullmatch(content):
             return "local_noise_filter"
+        # Private chats have no reliable keyword boundary: natural requests such as
+        # "תוכל להביא לי את המסמכים ביום ראשון?" otherwise never reach extraction.
+        if not data.is_group:
+            return None
         if (
             not RELEVANT_TEXT.search(content)
             and not RELATIVE_MINUTES_TEXT.search(content)
