@@ -531,6 +531,58 @@ async def test_urgent_outgoing_bypasses_buffer_without_duplicate_and_normalizes_
         assert len(llm.requests) == 1
 
 
+async def test_outbound_vague_promise_prompts_for_missing_detail(tmp_path: Path) -> None:
+    start = datetime(2026, 8, 1, 9, 0, tzinfo=UTC)
+    app = build_app(
+        tmp_path / "outbound-vague-promise.db",
+        MutableClock(start),
+        results=[
+            ExtractionResult(
+                language="he",
+                items=[
+                    CommitmentExtraction(
+                        kind="commitment",
+                        summary="לקבוע פגישה איתו",
+                        action_type="meet",
+                        direction="user_promised",
+                        confidence=0.95,
+                        evidence="אני אקבע איתו",
+                        ambiguous=True,
+                        needs_clarification=True,
+                        clarification_question="עם מי ועל מה לקבוע?",
+                    )
+                ],
+            )
+        ],
+    )
+
+    async with app_client(app) as client:
+        response = await signed_post(
+            client,
+            make_payload(
+                "promise-to-noam",
+                "אני אקבע איתו",
+                event="message.sent",
+                from_me=True,
+                chatName="נועם",
+            ),
+        )
+        assert response.json()["buffered"] is True
+        whatsapp = cast(WhatsAppService, app.state.whatsapp_service)
+        assert await whatsapp.flush_due_buffers(start + timedelta(minutes=3)) == 1
+
+    llm = cast(FakeLLMProvider, app.state.llm_provider)
+    assert len(llm.requests) == 1
+    assert llm.requests[0].direction is EventDirection.OUTBOUND
+    assert "אני אקבע איתו" in llm.requests[0].content_text
+    notifier = cast(FakeTelegramNotifier, app.state.notifier)
+    assert [item.kind for item in notifier.notifications] == ["detail_clarification_request"]
+    assert "עם מי ועל מה לקבוע?" in notifier.notifications[0].text
+    session_factory = cast(async_sessionmaker[AsyncSession], app.state.session_factory)
+    async with session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(ApprovalRequest)) == 1
+
+
 async def test_urgent_colloquial_outgoing_with_common_typos_is_not_filtered(
     tmp_path: Path,
 ) -> None:

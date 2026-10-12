@@ -65,6 +65,10 @@ For an outbound message in a private conversation, the supplied conversation lab
 recipient for context only. For example, "אחזור אלייך בעוד 10 דקות" can be a user commitment to
 that recipient. Do not infer a relationship beyond the supplied label, and do not turn a request
 that the recipient act (for example, "תתקשרי אליי") into a user commitment.
+An explicit first-person promise to arrange something, such as "אני אקבע איתו", is still a
+commitment even if the person or purpose is unclear. Extract the stated action, leave due_at
+empty, and ask one focused clarification question about the missing detail; do not guess who
+"איתו" refers to from the recipient label.
 For a tracked group conversation, use the supplied group label only as source context. Extract
 meeting plans, changes, cancellations, and possible commitments, but do not treat another group
 member's statement as a commitment made by the user.

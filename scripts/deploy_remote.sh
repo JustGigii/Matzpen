@@ -149,8 +149,9 @@ chown root:root "$DEPLOY_ROOT/.deployed-revision"
 trap - ERR
 echo "Deployment $REVISION completed successfully"
 
-# Notify only after the release and all health checks succeeded. Telegram delivery is
-# best-effort: a temporary messaging failure must not roll back a healthy deployment.
+# Notify only after the release and all health checks succeeded. A delivery failure
+# must be visible in CI, but must not roll back an otherwise healthy release.
 if ! "$PYTHON_BIN" "$DEPLOY_ROOT/scripts/notify_deploy_telegram.py" "$REVISION"; then
-  echo "Warning: Telegram deployment notification was not delivered" >&2
+  echo "Telegram deployment notification was not delivered" >&2
+  exit 4
 fi
